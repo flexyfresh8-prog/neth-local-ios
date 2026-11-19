@@ -1,0 +1,28 @@
+name: Build unsigned iPad IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Build and inspect the unsigned iPad app
+        run: bash scripts/build-ipa.sh
+      - uses: actions/upload-artifact@v6
+        with:
+          name: NethLocal-iPad-unsigned
+          path: |
+            out/NethLocal-unsigned.ipa
+            out/NethLocal.entitlements
+          if-no-files-found: error
+          compression-level: 0
