@@ -13,7 +13,7 @@ app="$payload/NethLocal.app"
 
 mkdir -p "$work" "$output"
 archive="$work/llama-$engine_tag-xcframework.zip"
-if ! printf '%s  %s\n' "$engine_sha" "$archive" | shasum -a 256 -c --status; then
+if [[ ! -f "$archive" ]] || ! printf '%s  %s\n' "$engine_sha" "$archive" | shasum -a 256 -c --status; then
     curl --fail --location --retry 2 --connect-timeout 15 --max-time 180 \
         --output "$archive.partial" \
         "https://github.com/ggml-org/llama.cpp/releases/download/$engine_tag/llama-$engine_tag-xcframework.zip"

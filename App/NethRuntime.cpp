@@ -74,7 +74,10 @@ static int32_t threads() {
 NLRuntime *nl_open(const char *model_path, int32_t context, bool metal,
                   NLCancel *cancel, char *error, size_t error_size) {
     static std::once_flag backend;
-    std::call_once(backend, llama_backend_init);
+    std::call_once(backend, [] {
+        llama_backend_init();
+        ggml_backend_load_all();
+    });
     if (stopped(cancel)) return nullptr;
 
     auto runtime = std::make_unique<NLRuntime>();

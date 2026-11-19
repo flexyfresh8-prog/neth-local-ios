@@ -163,7 +163,7 @@ final class LocalModels: ObservableObject {
 
     func download(_ asset: ModelAsset) {
         guard activeDownload == nil, !has(asset) else { return }
-        if let free = (try? root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsage]))?
+        if let free = (try? root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
             .volumeAvailableCapacityForImportantUsage, free < asset.bytes + 134_217_728 {
             problem = "Free at least \(Self.size(asset.bytes + 134_217_728)) of iPad storage to download this model."
             return
@@ -193,7 +193,6 @@ final class LocalModels: ObservableObject {
                         try FileManager.default.moveItem(at: downloaded, to: destination)
                     }.value
                     self.refresh()
-                    if asset == .qwen { self.selectedID = destination.path }
                 } catch {
                     try? FileManager.default.removeItem(at: temp)
                     if (error as? URLError)?.code != .cancelled { self.problem = error.localizedDescription }
