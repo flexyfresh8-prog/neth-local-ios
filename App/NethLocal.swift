@@ -71,6 +71,10 @@ private struct ChatScreen: View {
     }
 
     var body: some View {
+        observeChat(attachAlerts(attachSheet(layout)))
+    }
+
+    private var layout: some View {
         GeometryReader { geometry in
             let wide = geometry.size.width >= 850 && !typeSize.isAccessibilitySize
             let panelVisible = wide && showSidebar
@@ -95,8 +99,10 @@ private struct ChatScreen: View {
         }
         .foregroundStyle(NethPalette.text)
         .background(NethPalette.canvas.ignoresSafeArea())
-        .task { await chat.restore() }
-        .sheet(item: $sheet) { selected in
+    }
+
+    private func attachSheet(_ content: some View) -> some View {
+        content.sheet(item: $sheet) { selected in
             switch selected {
             case .history: sidebar(inSheet: true).presentationDetents([.large])
             case .search:
@@ -120,7 +126,10 @@ private struct ChatScreen: View {
                 }
             }
         }
-        .alert("Delete chat?", isPresented: Binding(
+    }
+
+    private func attachAlerts(_ content: some View) -> some View {
+        content.alert("Delete chat?", isPresented: Binding(
             get: { deleting != nil }, set: { if !$0 { deleting = nil } }), presenting: deleting) { selection in
                 Button("Delete", role: .destructive) { Task { await chat.remove(selection) } }
                 Button("Cancel", role: .cancel) {}
@@ -133,6 +142,21 @@ private struct ChatScreen: View {
             } message: {
                 Text(chat.problem ?? "")
             }
+        .alert("Save reply", isPresented: Binding(
+            get: { exporting != nil }, set: { if !$0 { exporting = nil } }), presenting: exporting) { reply in
+                TextField("Filename", text: $exportName)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                Button("Save") {
+                    let name = exportName
+                    Task { await chat.saveReply(reply.message, text: reply.text, as: name) }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: { _ in Text("Enter a filename such as Notes.md, Notes.txt or Notes.pdf.") }
+    }
+
+    private func observeChat(_ content: some View) -> some View {
+        content.task { await chat.restore() }
         .onChange(of: photoItem) { _, item in if let item { preparePhoto(item) } }
         .onChange(of: typing) { _, focused in if focused { expandedPicker = nil } }
         .onChange(of: sheet) { _, active in if active != nil { expandedPicker = nil } }
@@ -146,17 +170,6 @@ private struct ChatScreen: View {
             chat.unload()
             if !canAttach { clearAttachment() }
         }
-        .alert("Save reply", isPresented: Binding(
-            get: { exporting != nil }, set: { if !$0 { exporting = nil } }), presenting: exporting) { reply in
-                TextField("Filename", text: $exportName)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                Button("Save") {
-                    let name = exportName
-                    Task { await chat.saveReply(reply.message, text: reply.text, as: name) }
-                }
-                Button("Cancel", role: .cancel) {}
-            } message: { _ in Text("Enter a filename such as Notes.md, Notes.txt or Notes.pdf.") }
         .onChange(of: models.projector) { _, _ in if !canAttach { clearAttachment() } }
         .onChange(of: context) { _, _ in chat.unload() }
         .onChange(of: cache) { _, _ in chat.unload() }

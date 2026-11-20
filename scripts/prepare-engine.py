@@ -40,7 +40,9 @@ def prepare():
     with tarfile.open(ARCHIVE, "r:gz") as archive:
         archive.extractall(BUILD, filter="data")
     subprocess.run(["git", "init", "-q", str(SOURCE)], check=True)
-    subprocess.run(["git", "-C", str(SOURCE), "apply", "--unidiff-zero", "--whitespace=error", str(PATCH)], check=True)
+    patch = PATCH.read_bytes().replace(b"\r\n", b"\n")
+    subprocess.run(["git", "-C", str(SOURCE), "-c", "core.autocrlf=false",
+                    "apply", "--unidiff-zero", "--whitespace=error", "-"], input=patch, check=True)
     STAMP.write_text(version)
     return SOURCE
 
