@@ -1,5 +1,6 @@
 import AVFoundation
 import SwiftUI
+import UIKit
 import VisionKit
 
 @MainActor
@@ -8,8 +9,8 @@ struct WindowsComputeSection: View {
     let hasModel: Bool
     let busy: Bool
     let chooseModel: () -> Void
-    @State private var pairing = false
-    @State private var problem: String?
+    let pair: () -> Void
+    let report: (String) -> Void
 
     var body: some View {
         Section {
@@ -21,18 +22,19 @@ struct WindowsComputeSection: View {
                     chooseModel()
                     devices.choose(device)
                 } label: {
-                    deviceRow(device.name, detail: "5 GHz Mobile Hotspot", icon: "laptopcomputer",
+                    deviceRow(device.name, detail: devices.sessionOnly.contains(device.id) ? "Paired for this session" : "5 GHz Mobile Hotspot",
+                              icon: "laptopcomputer",
                               selected: devices.selectedID == device.id)
                 }
                 .disabled(!hasModel)
                 .swipeActions {
                     Button("Forget", role: .destructive) {
                         do { try devices.remove(device) }
-                        catch { problem = error.localizedDescription }
+                        catch { report(error.localizedDescription) }
                     }
                 }
             }
-            Button("Pair Windows device", systemImage: "qrcode.viewfinder") { pairing = true }
+            Button("Pair Windows device", systemImage: "qrcode.viewfinder", action: pair)
             if devices.compute != nil {
                 Picker("Layers on Windows", selection: $devices.layers) {
                     ForEach(WindowsCompute.splits, id: \.self) { layers in
@@ -51,21 +53,6 @@ struct WindowsComputeSection: View {
         }
         .listRowBackground(NethPalette.surface)
         .disabled(busy)
-        .sheet(isPresented: $pairing) {
-            WindowsPairingPanel { peer in
-                try devices.add(peer)
-                if hasModel {
-                    chooseModel()
-                    devices.choose(peer)
-                }
-            }
-        }
-        .alert("Windows compute", isPresented: Binding(
-            get: { problem != nil }, set: { if !$0 { problem = nil } })) {
-            Button("OK", role: .cancel) { problem = nil }
-        } message: {
-            Text(problem ?? "")
-        }
     }
 
     private func deviceRow(_ name: String, detail: String, icon: String, selected: Bool) -> some View {
@@ -86,51 +73,17 @@ struct WindowsComputeSection: View {
 }
 
 @MainActor
-private struct WindowsPairingPanel: View {
-    let paired: (WindowsDevice) throws -> Void
-    @Environment(\.dismiss) private var dismiss
+struct WindowsPairingPanel: View {
+    let paired: (WindowsDevice) -> Void
     @State private var code = ""
-    @State private var checking = false
+    @State private var pending: WindowsDevice?
+    @State private var showCamera = false
     @State private var scanning = false
     @State private var problem: String?
 
     var body: some View {
-        NavigationStack {
-            List {
-                Section {
-                    Text("Start the Windows companion and join its 5 GHz Mobile Hotspot in iPad Settings. Then scan the QR code shown on the laptop.")
-                        .foregroundStyle(NethPalette.muted)
-                    Button("Scan Windows QR code", systemImage: "qrcode.viewfinder") {
-                        Task { await scan() }
-                    }
-                    TextField("Pairing code", text: $code)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .privacySensitive()
-                        .onSubmit { add(code) }
-                    Button("Connect", systemImage: "link") { add(code) }
-                        .disabled(code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    if checking { ProgressView("Checking the 5 GHz connection…") }
-                    if let problem {
-                        Text(verbatim: problem).foregroundStyle(NethPalette.lilac)
-                    }
-                }
-                .listRowBackground(NethPalette.surface)
-                .disabled(checking)
-            }
-            .scrollContentBackground(.hidden)
-            .background(NethPalette.canvas)
-            .navigationTitle("Pair Windows device")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }.disabled(checking)
-                }
-            }
-        }
-        .interactiveDismissDisabled(checking)
-        .sheet(isPresented: $scanning) {
-            NavigationStack {
+        Group {
+            if scanning {
                 WindowsQRScanner { payload in
                     scanning = false
                     add(payload)
@@ -139,47 +92,111 @@ private struct WindowsPairingPanel: View {
                     problem = "The camera is unavailable. Paste the Windows pairing code to continue."
                 }
                 .ignoresSafeArea(edges: .bottom)
-                .navigationTitle("Scan pairing code")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button("Cancel") { scanning = false }
-                    }
+                .overlay(alignment: .bottom) {
+                    Text("Scan the QR code in Neth Local Windows")
+                        .font(.footnote.weight(.semibold))
+                        .padding(12)
+                        .background(.regularMaterial, in: .capsule)
+                        .padding()
+                        .allowsHitTesting(false)
+                }
+            } else {
+                pairingForm
+            }
+        }
+        .background(NethPalette.canvas)
+        .navigationTitle("Pair Windows device")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if scanning {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Enter code") { scanning = false }
                 }
             }
         }
+        .task(id: showCamera) {
+            if showCamera { await scan() }
+        }
+        .task(id: pending) {
+            if let pending { await connect(pending) }
+        }
+    }
+
+    private var pairingForm: some View {
+        List {
+            Section {
+                Text("Join the laptop’s 5 GHz Mobile Hotspot in iPad Settings. Then scan the QR code in Neth Local Windows or paste its pairing code.")
+                    .foregroundStyle(NethPalette.muted)
+                Button("Scan Windows QR code", systemImage: "qrcode.viewfinder") { showCamera = true }
+                    .disabled(showCamera)
+                TextField("Pairing code", text: $code)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .privacySensitive()
+                    .onSubmit { add(code) }
+                PasteButton(payloadType: String.self) { values in
+                    if let value = values.first { code = value }
+                }
+                Button("Connect", systemImage: "link") { add(code) }
+                    .disabled(code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .listRowBackground(NethPalette.surface)
+            .disabled(pending != nil || showCamera)
+            if pending != nil {
+                Section {
+                    ProgressView("Checking the hotspot connection…")
+                    Button("Cancel connection") { pending = nil }
+                }
+                .listRowBackground(NethPalette.surface)
+            }
+            if let problem {
+                Text(verbatim: problem)
+                    .foregroundStyle(NethPalette.lilac)
+                    .listRowBackground(NethPalette.surface)
+            }
+        }
+        .scrollContentBackground(.hidden)
     }
 
     private func scan() async {
-        guard DataScannerViewController.isSupported,
-              await AVCaptureDevice.requestAccess(for: .video),
-              DataScannerViewController.isAvailable else {
+        defer { showCamera = false }
+        let available = DataScannerViewController.isSupported
+        let allowed = available ? await AVCaptureDevice.requestAccess(for: .video) : false
+        guard !Task.isCancelled else { return }
+        guard allowed, DataScannerViewController.isAvailable else {
             problem = "Camera access is unavailable. Paste the Windows pairing code to continue."
             return
         }
+        problem = nil
         scanning = true
     }
 
     private func add(_ candidate: String) {
-        guard !checking else { return }
+        guard pending == nil else { return }
         do {
-            let peer = try WindowsDevice.parse(candidate)
-            checking = true
+            pending = try WindowsDevice.parse(candidate)
             problem = nil
-            Task {
-                defer { checking = false }
-                do {
-                    try await Task.detached(priority: .userInitiated) {
-                        try WindowsLink(device: peer).open()
-                    }.value
-                    try paired(peer)
-                    dismiss()
-                } catch {
-                    problem = error.localizedDescription
-                }
-            }
         } catch {
             problem = error.localizedDescription
+        }
+    }
+
+    private func connect(_ peer: WindowsDevice) async {
+        let stop = GenerationStop()
+        defer { if !Task.isCancelled { pending = nil } }
+        do {
+            try await withTaskCancellationHandler {
+                try await Task.detached(priority: .userInitiated) {
+                    try WindowsLink(device: peer, stop: stop).open()
+                }.value
+                try Task.checkCancellation()
+            } onCancel: {
+                stop.request()
+            }
+            code = ""
+            paired(peer)
+        } catch {
+            if !Task.isCancelled { problem = error.localizedDescription }
         }
     }
 }
@@ -188,43 +205,84 @@ private struct WindowsQRScanner: UIViewControllerRepresentable {
     let found: (String) -> Void
     let failed: () -> Void
 
-    func makeCoordinator() -> Coordinator { Coordinator(found: found) }
+    func makeCoordinator() -> Coordinator { Coordinator(found: found, failed: failed) }
 
-    func makeUIViewController(context: Context) -> DataScannerViewController {
+    func makeUIViewController(context: Context) -> ScannerHost {
         let scanner = DataScannerViewController(recognizedDataTypes: [.barcode(symbologies: [.qr])],
                                                 qualityLevel: .balanced, recognizesMultipleItems: false,
                                                 isHighFrameRateTrackingEnabled: false, isHighlightingEnabled: true)
         scanner.delegate = context.coordinator
-        DispatchQueue.main.async {
+        return ScannerHost(scanner: scanner, failed: failed)
+    }
+
+    func updateUIViewController(_ host: ScannerHost, context: Context) {}
+
+    static func dismantleUIViewController(_ host: ScannerHost, coordinator: Coordinator) {
+        host.scanner.stopScanning()
+    }
+
+    final class ScannerHost: UIViewController {
+        let scanner: DataScannerViewController
+        let failed: () -> Void
+
+        init(scanner: DataScannerViewController, failed: @escaping () -> Void) {
+            self.scanner = scanner
+            self.failed = failed
+            super.init(nibName: nil, bundle: nil)
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) { fatalError("Use init(scanner:failed:)") }
+
+        override func viewDidLoad() {
+            super.viewDidLoad()
+            addChild(scanner)
+            scanner.view.frame = view.bounds
+            scanner.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            view.addSubview(scanner.view)
+            scanner.didMove(toParent: self)
+        }
+
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
             do { try scanner.startScanning() }
             catch { failed() }
         }
-        return scanner
-    }
 
-    func updateUIViewController(_ scanner: DataScannerViewController, context: Context) {}
-
-    static func dismantleUIViewController(_ scanner: DataScannerViewController, coordinator: Coordinator) {
-        scanner.stopScanning()
+        override func viewWillDisappear(_ animated: Bool) {
+            scanner.stopScanning()
+            super.viewWillDisappear(animated)
+        }
     }
 
     final class Coordinator: NSObject, DataScannerViewControllerDelegate {
         let found: (String) -> Void
-        private var recognized = false
+        let failed: () -> Void
+        private var finished = false
 
-        init(found: @escaping (String) -> Void) { self.found = found }
+        init(found: @escaping (String) -> Void, failed: @escaping () -> Void) {
+            self.found = found
+            self.failed = failed
+        }
 
         func dataScanner(_ scanner: DataScannerViewController, didAdd addedItems: [RecognizedItem],
                          allItems: [RecognizedItem]) {
-            guard !recognized else { return }
+            guard !finished else { return }
             for item in addedItems {
-                if case .barcode(let barcode) = item, let code = barcode.payloadStringValue, code.hasPrefix("NETH36.") {
-                    recognized = true
+                if case .barcode(let barcode) = item, let code = barcode.payloadStringValue,
+                   code.hasPrefix(WindowsDevice.pairingPrefix) {
+                    finished = true
                     scanner.stopScanning()
                     found(code)
                     break
                 }
             }
+        }
+
+        func dataScanner(_ scanner: DataScannerViewController, becameUnavailableWithError error: DataScannerViewController.ScanningUnavailable) {
+            guard !finished else { return }
+            finished = true
+            failed()
         }
     }
 }

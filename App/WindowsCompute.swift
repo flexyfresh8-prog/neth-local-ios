@@ -10,22 +10,26 @@ struct WindowsDevice: Codable, Identifiable, Equatable, Sendable {
     let fingerprint: Data
     let secret: Data
 
+    static let pairingPrefix = "NETH36."
+
     var id: String { fingerprint.base64EncodedString() }
+
+    var isValid: Bool {
+        fingerprint.count == 32 && secret.count == 32 &&
+        !name.isEmpty && name.utf8.count <= 128 &&
+        (IPv4Address(address).map(Self.privateAddress) ?? false)
+    }
 
     static func parse(_ input: String) throws -> Self {
         let code = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        let prefix = "NETH36."
-        let invalid = LocalError(message: "Scan or paste a pairing code from Neth Local Windows v3.6.")
-        guard code.hasPrefix(prefix), code.utf8.count < 1024 else { throw invalid }
-        var encoded = String(code.dropFirst(prefix.count))
+        let invalid = LocalError(message: "Scan the QR code or copy the pairing code from Neth Local Windows.")
+        guard code.hasPrefix(pairingPrefix), code.utf8.count < 1024 else { throw invalid }
+        var encoded = String(code.dropFirst(pairingPrefix.count))
             .replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
         encoded += String(repeating: "=", count: (4 - encoded.utf8.count % 4) % 4)
         guard let data = Data(base64Encoded: encoded),
               let peer = try? JSONDecoder().decode(Self.self, from: data),
-              peer.fingerprint.count == 32, peer.secret.count == 32,
-              !peer.name.isEmpty, peer.name.utf8.count <= 128,
-              let ip = IPv4Address(peer.address), ip.debugDescription == peer.address,
-              Self.privateAddress(ip) else { throw invalid }
+              peer.isValid else { throw invalid }
         return peer
     }
 
@@ -47,6 +51,7 @@ struct WindowsCompute: Equatable, Sendable {
 final class WindowsDevices: ObservableObject {
     @Published private(set) var devices: [WindowsDevice]
     @Published private(set) var selectedID: String?
+    @Published private(set) var sessionOnly: Set<String> = []
     @Published var layers: Int {
         didSet { UserDefaults.standard.set(layers, forKey: "windowsLayers") }
     }
@@ -61,35 +66,44 @@ final class WindowsDevices: ObservableObject {
         kSecAttrService as String: "com.neth.local.windows",
         kSecAttrAccount as String: "paired-devices"
     ]
+    private var storedIDs: Set<String> = []
 
     init() {
         var query = Self.keychain
         query[kSecReturnData as String] = true
         var result: CFTypeRef?
         if SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess, let data = result as? Data {
-            devices = (try? JSONDecoder().decode([WindowsDevice].self, from: data)) ?? []
+            devices = (try? JSONDecoder().decode([WindowsDevice].self, from: data).filter(\.isValid)) ?? []
         } else {
             devices = []
         }
         let storedLayers = UserDefaults.standard.integer(forKey: "windowsLayers")
         layers = WindowsCompute.splits.contains(storedLayers) ? storedLayers : 8
         selectedID = UserDefaults.standard.string(forKey: "windowsDevice")
+        storedIDs = Set(devices.map(\.id))
     }
 
     func choose(_ device: WindowsDevice?) {
         selectedID = device?.id
-        UserDefaults.standard.set(selectedID, forKey: "windowsDevice")
+        let persisted = device.flatMap { sessionOnly.contains($0.id) ? nil : $0.id }
+        UserDefaults.standard.set(persisted, forKey: "windowsDevice")
     }
 
-    func add(_ device: WindowsDevice) throws {
+    func add(_ device: WindowsDevice) {
         let updated = [device] + Array(devices.filter { $0.id != device.id }.prefix(7))
-        try store(updated)
+        do {
+            try store(updated)
+        } catch {
+            sessionOnly.insert(device.id)
+            sessionOnly.formIntersection(updated.map(\.id))
+        }
         devices = updated
     }
 
     func remove(_ device: WindowsDevice) throws {
         let updated = devices.filter { $0.id != device.id }
-        try store(updated)
+        if storedIDs.contains(device.id) { try store(updated) }
+        sessionOnly.remove(device.id)
         devices = updated
         if selectedID == device.id { choose(nil) }
     }
@@ -97,14 +111,25 @@ final class WindowsDevices: ObservableObject {
     private func store(_ updated: [WindowsDevice]) throws {
         let data = try JSONEncoder().encode(updated)
         let status = SecItemUpdate(Self.keychain as CFDictionary, [kSecValueData as String: data] as CFDictionary)
-        if status == errSecSuccess { return }
+        if status == errSecSuccess {
+            didStore(updated)
+            return
+        }
         if status == errSecItemNotFound {
             var item = Self.keychain
             item[kSecValueData as String] = data
             item[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-            if SecItemAdd(item as CFDictionary, nil) == errSecSuccess { return }
+            if SecItemAdd(item as CFDictionary, nil) == errSecSuccess {
+                didStore(updated)
+                return
+            }
         }
         throw LocalError(message: "This installation could not save the Windows pairing in the iPad keychain.")
+    }
+
+    private func didStore(_ devices: [WindowsDevice]) {
+        storedIDs = Set(devices.map(\.id))
+        sessionOnly.removeAll()
     }
 }
 
@@ -159,18 +184,22 @@ final class WindowsLink {
     deinit { connection.cancel() }
 
     func open() throws {
+        var tlsConnected = false
         do {
-            let _: Void = try wait(seconds: 10) { done in
-                connection.stateUpdateHandler = { state in
+            let _: Void = try wait(seconds: 15) { done in
+                connection.stateUpdateHandler = { [weak connection] state in
                     switch state {
                     case .ready: done(.success(()))
                     case .failed(let error): done(.failure(error))
+                    case .waiting where connection?.currentPath?.unsatisfiedReason == .localNetworkDenied:
+                        done(.failure(LocalError(message: "Allow Neth Local under iPad Settings → Privacy & Security → Local Network, then try again.")))
                     case .cancelled: done(.failure(CancellationError()))
                     default: break
                     }
                 }
                 connection.start(queue: queue)
             }
+            tlsConnected = true
             var hello = Data("NETH36/1".utf8)
             hello.append(device.secret)
             try send(hello)
@@ -178,7 +207,20 @@ final class WindowsLink {
         } catch {
             connection.cancel()
             if stop?.cancelled == true { throw CancellationError() }
-            throw LocalError(message: "Couldn’t connect to \(device.name). Join its 5 GHz Mobile Hotspot, allow Local Network access, and check that its Neth Local server is running. Scan its current QR code if the pairing changed.")
+            if tlsConnected {
+                throw LocalError(message: "Pairing with \(device.name) did not finish. Scan the current QR code in the Windows app and try again.")
+            }
+            if let networkError = error as? NWError {
+                switch networkError {
+                case .tls:
+                    throw LocalError(message: "The certificate for \(device.name) did not verify. Scan the current QR code in the Windows app.")
+                case .posix(.ECONNREFUSED):
+                    throw LocalError(message: "\(device.name) refused the connection. Click Start server in the Windows app and check its status.")
+                default: break
+                }
+            }
+            if let reason = error as? LocalError, reason.message.hasPrefix("Allow Neth Local") { throw reason }
+            throw LocalError(message: "Couldn’t reach \(device.name) at \(device.address). Join its 5 GHz Mobile Hotspot, allow Local Network access, and check the Windows server status.")
         }
     }
 

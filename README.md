@@ -18,9 +18,9 @@ Use **Import GGUF** to add other decoder models with a llama.cpp-supported archi
 
 ## Share Qwen with Windows
 
-1. Run **NethLocal-Windows-v3.6.exe** on Windows 11 x64 and choose **Download model**. Download the bundled Qwen3.5 4B in the iPad app as well.
+1. Run **NethLocal-Windows-v3.6.1.exe** on Windows 11 x64 and choose **Download model**. Download the bundled Qwen3.5 4B in the iPad app as well.
 2. In the Windows companion, open **Mobile Hotspot settings**. Set **Share over** to **Wi-Fi** and **Network band** to **5 GHz**. Turn on Mobile Hotspot, then choose **Start server**. The companion checks the selected band and listens on the hotspot adapter.
-3. Join the Windows hotspot on the iPad. In Neth Local, open **Models & context → Compute device → Pair Windows device**. Scan the Windows QR code and allow Local Network access. The Windows computer appears by name in the device list.
+3. Join the Windows hotspot on the iPad. In Neth Local, open **Models & context → Compute device → Pair Windows device**. Scan the QR code from the Windows app or paste its pairing code, then allow Local Network access. The Windows computer appears by name in the device list.
 4. Select the Windows computer and send a text prompt. **Layers on Windows** controls how many of the first 32 Qwen layers run on the laptop CPU. The iPad runs the remaining layers and samples the response. Check the composer for the measured token rate and use **This iPad** for a local comparison.
 
 Both devices read their own copy of the same model. The shared link carries token IDs and intermediate activations over TLS. The iPad verifies the certificate from the pairing code. Treat the QR code and the copied pairing code as credentials. Shared mode supports text and up to 32K context. Local mode supports photos and prompt checkpoints. The Windows companion uses an AVX2-capable x64 CPU. Single-reply speed depends on the two devices and network latency.

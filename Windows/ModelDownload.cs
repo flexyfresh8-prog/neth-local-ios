@@ -13,7 +13,14 @@ internal sealed class ModelDownload(string directory)
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromMinutes(2) };
 
     public string FilePath => Path.Combine(directory, FileName);
-    public bool LooksDownloaded => File.Exists(FilePath) && new FileInfo(FilePath).Length == Length;
+    public bool LooksDownloaded
+    {
+        get
+        {
+            var file = new FileInfo(FilePath);
+            return file.Exists && file.Length == Length;
+        }
+    }
 
     public async Task<bool> VerifyAsync(CancellationToken stop)
     {
@@ -35,6 +42,7 @@ internal sealed class ModelDownload(string directory)
         {
             if (offset == Length && await CheckHashAsync(partial, stop))
             {
+                stop.ThrowIfCancellationRequested();
                 File.Move(partial, FilePath, overwrite: true);
                 progress.Report((Length, Length));
                 return;
@@ -43,14 +51,20 @@ internal sealed class ModelDownload(string directory)
             offset = 0;
         }
 
-        using var request = new HttpRequestMessage(HttpMethod.Get, PinnedUrl);
-        if (offset > 0) request.Headers.Range = new RangeHeaderValue(offset, null);
-        using var response = await Http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, stop);
+        using var resumed = await RequestAsync(offset, stop);
+        bool restart = offset > 0 && (resumed.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable ||
+            (resumed.StatusCode == HttpStatusCode.PartialContent && !MatchesRange(resumed, offset)));
+        if (restart)
+        {
+            resumed.Dispose();
+            offset = 0;
+        }
+        using var restarted = restart ? await RequestAsync(0, stop) : null;
+        var response = restarted ?? resumed;
         response.EnsureSuccessStatusCode();
         if (response.StatusCode == HttpStatusCode.PartialContent)
         {
-            var range = response.Content.Headers.ContentRange;
-            if (range is null || range.From != offset || range.Length != Length)
+            if (!MatchesRange(response, offset))
                 throw new IOException("The model server returned a different download range.");
         }
         else
@@ -63,17 +77,28 @@ internal sealed class ModelDownload(string directory)
         {
             var buffer = new byte[256 * 1024];
             var nextUpdate = Environment.TickCount64;
-            int amount;
-            while ((amount = await source.ReadAsync(buffer, stop).AsTask().WaitAsync(TimeSpan.FromMinutes(2), stop)) > 0)
+            using var idle = CancellationTokenSource.CreateLinkedTokenSource(stop);
+            try
             {
-                offset += amount;
-                if (offset > Length) throw new IOException("The download is larger than the pinned model.");
-                await target.WriteAsync(buffer.AsMemory(0, amount), stop);
-                if (Environment.TickCount64 >= nextUpdate)
+                while (true)
                 {
-                    progress.Report((offset, Length));
-                    nextUpdate = Environment.TickCount64 + 150;
+                    idle.CancelAfter(TimeSpan.FromMinutes(2));
+                    int amount = await source.ReadAsync(buffer, idle.Token);
+                    idle.CancelAfter(Timeout.InfiniteTimeSpan);
+                    if (amount == 0) break;
+                    offset += amount;
+                    if (offset > Length) throw new IOException("The download is larger than the pinned model.");
+                    await target.WriteAsync(buffer.AsMemory(0, amount), stop);
+                    if (Environment.TickCount64 >= nextUpdate)
+                    {
+                        progress.Report((offset, Length));
+                        nextUpdate = Environment.TickCount64 + 150;
+                    }
                 }
+            }
+            catch (OperationCanceledException) when (!stop.IsCancellationRequested)
+            {
+                throw new IOException("The model download stopped receiving data. Press Download model to resume.");
             }
         }
         if (offset != Length) throw new IOException("Download interrupted. Press Download to resume.");
@@ -83,7 +108,23 @@ internal sealed class ModelDownload(string directory)
             File.Delete(partial);
             throw new IOException("The downloaded model did not match the expected SHA-256.");
         }
+        stop.ThrowIfCancellationRequested();
         File.Move(partial, FilePath, overwrite: true);
+    }
+
+    private static bool MatchesRange(HttpResponseMessage response, long offset) =>
+        response.Content.Headers.ContentRange is { } range &&
+        range.From == offset && range.Length == Length && range.To == Length - 1;
+
+    private static async Task<HttpResponseMessage> RequestAsync(long offset, CancellationToken stop)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, PinnedUrl);
+        if (offset > 0) request.Headers.Range = new RangeHeaderValue(offset, null);
+        try { return await Http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, stop); }
+        catch (OperationCanceledException) when (!stop.IsCancellationRequested)
+        {
+            throw new IOException("The model host did not respond. Press Download model to retry.");
+        }
     }
 
     private static async Task<bool> CheckHashAsync(string path, CancellationToken stop)

@@ -109,6 +109,10 @@ int run(const std::filesystem::path & path) {
     std::array<int32_t, 2> arguments{};
     std::array<llama_token, neth::batch_size> tokens{};
     while (receive(&command, sizeof(command))) {
+        if (command == 0) {
+            if (!result(0)) return 1;
+            continue;
+        }
         if (!receive(arguments.data(), sizeof(arguments))) return 1;
         if (command == 1) {
             if (!result(stage.configure(arguments[0], arguments[1]) ? 0 : 1)) return 1;

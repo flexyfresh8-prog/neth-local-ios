@@ -58,6 +58,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $worker = (Resolve-Path .build/windows/bin/Release/neth-qwen-worker.exe).Path
           "NETH_WORKER_EXE=$worker" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Check Windows pairing and worker recovery
+        shell: pwsh
+        run: |
+          dotnet build scripts/check-windows-peer/CheckWindowsPeer.csproj -c Release "-p:WorkerExecutable=$env:NETH_WORKER_EXE"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet scripts/check-windows-peer/bin/Release/net8.0-windows/CheckWindowsPeer.dll
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Publish standalone Windows companion
         shell: pwsh
         run: |

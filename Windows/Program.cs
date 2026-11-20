@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Net.Sockets;
 using System.Runtime.Intrinsics.X86;
 using QRCoder;
 
@@ -48,16 +49,20 @@ internal sealed class ServerWindow : Form
     private readonly PictureBox qr = new() { Dock = DockStyle.Fill, SizeMode = PictureBoxSizeMode.Zoom, Margin = new Padding(0, 8, 0, 8) };
     private CancellationTokenSource? downloadStop;
     private ComputeServer? server;
+    private Task? operation;
+    private object? session;
     private string? code;
     private bool verified;
     private bool busy;
     private bool closing;
+    private bool readyToClose;
 
     public ServerWindow()
     {
-        Text = "Neth Local Windows · 3.6";
-        ClientSize = new Size(510, 639);
-        MinimumSize = new Size(470, 678);
+        var version = typeof(ServerWindow).Assembly.GetName().Version!.ToString(3);
+        Text = $"Neth Local Windows · {version}";
+        ClientSize = new Size(510, 692);
+        MinimumSize = new Size(400, 400);
         StartPosition = FormStartPosition.CenterScreen;
         AutoScaleMode = AutoScaleMode.Dpi;
         BackColor = Canvas;
@@ -65,13 +70,10 @@ internal sealed class ServerWindow : Form
         Font = new Font("Segoe UI", 10F, FontStyle.Regular);
         var layout = new TableLayoutPanel
         {
-            ColumnCount = 1, RowCount = 11, Dock = DockStyle.Fill, Padding = new Padding(20)
+            ColumnCount = 1, RowCount = 11, Dock = DockStyle.Top, Height = 692, Padding = new Padding(20)
         };
-        foreach (int size in new[] { 40, 40, 43, 17, 52, 38, 46, 46 })
+        foreach (int size in new[] { 40, 45, 44, 17, 49, 47, 46, 74, 192, 54, 44 })
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, size));
-        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
         var title = new Label
         {
             Text = "Neth Local Windows", ForeColor = TextColor, Dock = DockStyle.Fill,
@@ -88,19 +90,33 @@ internal sealed class ServerWindow : Form
         layout.Controls.Add(qr, 0, 8);
         layout.Controls.Add(pairing, 0, 9);
         layout.Controls.Add(copy, 0, 10);
-        Controls.Add(layout);
+        var scroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true };
+        scroll.Controls.Add(layout);
+        Controls.Add(scroll);
 
-        Shown += async (_, _) => await CheckModelAsync();
-        download.Click += async (_, _) => await DownloadAsync();
-        toggle.Click += async (_, _) =>
+        Shown += (_, _) => Run(CheckModelAsync);
+        download.Click += (_, _) =>
         {
-            if (server is null) await StartAsync();
-            else await StopAsync("Server stopped");
+            if (downloadStop is { } active)
+            {
+                active.Cancel();
+                UpdateControls();
+            }
+            else Run(DownloadAsync);
         };
-        hotspot.Click += (_, _) => Process.Start(new ProcessStartInfo("ms-settings:network-mobilehotspot")
+        toggle.Click += (_, _) =>
         {
-            UseShellExecute = true
-        });
+            if (server is null) Run(StartAsync);
+            else Run(() => StopAsync("Server stopped"));
+        };
+        hotspot.Click += (_, _) =>
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo("ms-settings:network-mobilehotspot") { UseShellExecute = true })?.Dispose();
+            }
+            catch (Exception error) { serviceStatus.Text = $"Open Mobile Hotspot in Windows Settings. {error.Message}"; }
+        };
         copy.Click += (_, _) =>
         {
             if (code is { } value)
@@ -131,13 +147,13 @@ internal sealed class ServerWindow : Form
 
     private async Task CheckModelAsync()
     {
-        if (!model.LooksDownloaded) return;
         busy = true;
-        modelStatus.Text = "Checking the downloaded model…";
         UpdateControls();
         try
         {
-            verified = await model.VerifyAsync(lifetime.Token);
+            if (!model.LooksDownloaded) return;
+            modelStatus.Text = "Checking the downloaded model…";
+            verified = await Task.Run(() => model.VerifyAsync(lifetime.Token), lifetime.Token);
             modelStatus.Text = verified ? "Qwen3.5 4B model ready" : "Model verification failed. Download it again.";
             progress.Value = verified ? progress.Maximum : 0;
         }
@@ -152,11 +168,6 @@ internal sealed class ServerWindow : Form
 
     private async Task DownloadAsync()
     {
-        if (downloadStop is { } active)
-        {
-            active.Cancel();
-            return;
-        }
         using var operation = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
         downloadStop = operation;
         modelStatus.Text = "Connecting to the model download…";
@@ -171,7 +182,7 @@ internal sealed class ServerWindow : Form
         });
         try
         {
-            await model.DownloadAsync(report, operation.Token);
+            await Task.Run(() => model.DownloadAsync(report, operation.Token), operation.Token);
             verified = true;
             progress.Value = progress.Maximum;
             modelStatus.Text = "Qwen3.5 4B model ready";
@@ -192,39 +203,61 @@ internal sealed class ServerWindow : Form
         serviceStatus.Text = "Checking the 5 GHz hotspot…";
         UpdateControls();
         PairingIdentity? identity = null;
+        LayerWorker? worker = null;
+        Bitmap? pairingImage = null;
         try
         {
-            var network = await Task.Run(Hotspot.Read, lifetime.Token);
-            if (closing) return;
+            if (!model.LooksDownloaded)
+            {
+                verified = false;
+                progress.Value = 0;
+                modelStatus.Text = "The model file is missing or incomplete. Download it again.";
+                serviceStatus.Text = "Server stopped";
+                return;
+            }
+            var network = await Task.Run(() => Hotspot.WaitAsync(lifetime.Token), lifetime.Token);
+            lifetime.Token.ThrowIfCancellationRequested();
+            serviceStatus.Text = "Starting the Qwen worker…";
+            worker = new LayerWorker(model.FilePath);
+            await Task.Run(() => worker.ProbeAsync(lifetime.Token), lifetime.Token);
+            network = await Task.Run(() => Hotspot.Read(network), lifetime.Token);
+            lifetime.Token.ThrowIfCancellationRequested();
             identity = new PairingIdentity(DataDirectory);
             var newCode = identity.Code(network);
             using var qrData = QRCodeGenerator.GenerateQrCode(newCode, QRCodeGenerator.ECCLevel.M);
             var png = new PngByteQRCode(qrData).GetGraphic(6);
             using var stream = new MemoryStream(png);
             using var image = Image.FromStream(stream);
+            pairingImage = new Bitmap(image);
 
             var owner = new object();
-            server = new ComputeServer(network, identity, model.FilePath,
+            server = new ComputeServer(network, identity, worker,
                 message => Post(() => { if (ReferenceEquals(session, owner)) serviceStatus.Text = message; }),
-                message => Post(async () => { if (ReferenceEquals(session, owner)) await StopAsync(message); }));
+                message => Post(() => { if (ReferenceEquals(session, owner)) Run(() => StopAsync(message)); }));
             session = owner;
             identity = null;
+            worker = null;
             code = newCode;
-            qr.Image = new Bitmap(image);
+            qr.Image = pairingImage;
+            pairingImage = null;
             pairing.Text = $"Join “{network.Name}” on the iPad and scan this code in Models & context.";
-            serviceStatus.Text = "Ready for the paired iPad. Allow the app through Windows Firewall if prompted.";
+            serviceStatus.Text = $"Ready on 5 GHz at {network.Address}. Allow the app through Windows Firewall if prompted.";
         }
         catch (OperationCanceledException) { }
+        catch (SocketException error) when (error.SocketErrorCode == SocketError.AddressAlreadyInUse)
+        {
+            serviceStatus.Text = $"Port {ComputeServer.Port} is already in use. Close the other server and try again.";
+        }
         catch (Exception error) { serviceStatus.Text = error.Message; }
         finally
         {
             identity?.Dispose();
+            if (worker is not null) await Task.Run(worker.Dispose);
+            pairingImage?.Dispose();
             busy = false;
             UpdateControls();
         }
     }
-
-    private object? session;
 
     private async Task StopAsync(string message)
     {
@@ -240,6 +273,7 @@ internal sealed class ServerWindow : Form
         serviceStatus.Text = message;
         UpdateControls();
         try { await active.DisposeAsync(); }
+        catch (Exception error) { serviceStatus.Text = error.Message; }
         finally
         {
             busy = false;
@@ -254,29 +288,40 @@ internal sealed class ServerWindow : Form
         catch (InvalidOperationException) { }
     }
 
+    private void Run(Func<Task> action)
+    {
+        if (!closing && operation is not { IsCompleted: false }) operation = action();
+    }
+
     private void UpdateControls()
     {
         if (closing) return;
         download.Text = downloadStop is null ? (verified ? "Model downloaded" : "Download model") : "Pause download";
-        download.Enabled = !busy && !verified && server is null;
+        download.Enabled = !busy && !verified && server is null && downloadStop?.IsCancellationRequested != true;
         toggle.Text = server is null ? "Start server" : "Stop server";
         toggle.Enabled = !busy && verified;
         copy.Enabled = code is not null;
     }
 
-    protected override async void OnFormClosing(FormClosingEventArgs e)
+    protected override void OnFormClosing(FormClosingEventArgs e)
     {
-        if (!closing)
-        {
-            closing = true;
-            lifetime.Cancel();
-            if (server is not null)
-            {
-                e.Cancel = true;
-                await StopAsync("Server stopped");
-                if (IsHandleCreated) BeginInvoke(Close);
-            }
-        }
         base.OnFormClosing(e);
+        if (e.Cancel || readyToClose) return;
+        e.Cancel = true;
+        if (closing) return;
+        closing = true;
+        Enabled = false;
+        lifetime.Cancel();
+        _ = FinishClosingAsync();
+    }
+
+    private async Task FinishClosingAsync()
+    {
+        await Task.Yield();
+        if (operation is { } pending) await pending;
+        await StopAsync("Server stopped");
+        lifetime.Dispose();
+        readyToClose = true;
+        Close();
     }
 }
