@@ -19,6 +19,7 @@ typedef struct {
 
 typedef void (*NLChunk)(const uint8_t *bytes, size_t count, void *user);
 typedef void (*NLProgress)(int32_t generated, double seconds_since_first_token, void *user);
+typedef bool (*NLPrefix)(const int32_t *tokens, int32_t count, int32_t position, float *activation, void *user);
 
 enum { NL_OK = 0, NL_STOPPED = 1, NL_ERROR = 2, NL_RETRY = 3 };
 enum { NL_FINISH_EOG = 0, NL_FINISH_OUTPUT = 1, NL_FINISH_CONTEXT = 2, NL_FINISH_STOPPED = 3 };
@@ -34,6 +35,8 @@ typedef struct {
     bool reuse_prompt;
     const char *checkpoint_path;
     bool deterministic;
+    NLPrefix prefix;
+    void *prefix_user;
 } NLGeneration;
 
 typedef struct {
@@ -53,6 +56,8 @@ void nl_cancel_free(NLCancel *cancel);
 
 NLRuntime *nl_open(const char *model_path, int32_t context, bool metal, int32_t cache,
                   NLCancel *cancel, char *error, size_t error_size);
+NLRuntime *nl_open_shared(const char *model_path, int32_t context, bool metal, int32_t cache,
+                         int32_t windows_layers, NLCancel *cancel, char *error, size_t error_size);
 void nl_close(NLRuntime *runtime);
 int32_t nl_context_window(const NLRuntime *runtime);
 int32_t nl_context_cache(const NLRuntime *runtime);

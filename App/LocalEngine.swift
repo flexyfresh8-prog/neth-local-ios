@@ -9,6 +9,7 @@ struct EngineSettings: Equatable, Sendable {
     let cache: CachePrecision
     let compactHistory: Bool
     let promptCache: PromptCacheMode
+    let windows: WindowsCompute?
 }
 
 struct RuntimeProfile: Equatable, Sendable {
@@ -80,6 +81,12 @@ private let receiveProgress: NLProgress = { count, seconds, user in
     sink.continuation.yield(.progress(tokens: Int(count), seconds: seconds))
 }
 
+private let requestWindowsPrefix: NLPrefix = { tokens, count, position, activation, user in
+    guard let tokens, let activation, let user else { return false }
+    let link = Unmanaged<WindowsLink>.fromOpaque(user).takeUnretainedValue()
+    return link.compute(tokens: tokens, count: count, position: position, output: activation)
+}
+
 final class LocalEngine: @unchecked Sendable {
     private struct RuntimeKey: Equatable {
         let url: URL
@@ -87,6 +94,7 @@ final class LocalEngine: @unchecked Sendable {
         let cpuOnly: Bool
         let vision: Bool
         let cache: CachePrecision
+        let windows: WindowsCompute?
     }
 
     private let work = DispatchQueue(label: "com.neth.local.inference", qos: .userInitiated)
@@ -179,16 +187,20 @@ final class LocalEngine: @unchecked Sendable {
 
     private func generate(_ request: ModelRequest, settings: EngineSettings, stop: GenerationStop,
                           continuation: AsyncThrowingStream<EngineEvent, Error>.Continuation) throws {
-        let vision = settings.projector != nil && request.history.contains { $0.photo != nil }
-        let key = RuntimeKey(url: settings.model.url, context: settings.context, cpuOnly: settings.cpuOnly,
-                             vision: vision, cache: settings.cache)
+        let shared = settings.windows
+        let requestedContext = shared == nil ? settings.context : min(settings.context, WindowsCompute.maxContext)
+        let vision = shared == nil && settings.projector != nil && request.history.contains { $0.photo != nil }
+        let key = RuntimeKey(url: settings.model.url, context: requestedContext, cpuOnly: settings.cpuOnly,
+                             vision: vision, cache: settings.cache, windows: shared)
         if runtimeKey != key { releaseRuntime() }
 
         let photoBudget: Int64 = vision ? 1_210_000_000 : 0
-        let cacheBudget: Int64 = settings.model.isPreset ? settings.cache.bytesPerToken(at: settings.context) : 131_072
-        let overhead: Int64 = 440_000_000 + Int64(settings.context) * cacheBudget
+        let cacheBudget: Int64 = settings.model.isPreset ? settings.cache.bytesPerToken(at: requestedContext) : 131_072
+        let localLayers = Int64(32 - (shared?.layers ?? 0))
+        let localWeights = settings.model.bytes * (localLayers + 4) / 36
+        let overhead: Int64 = 440_000_000 + Int64(requestedContext) * cacheBudget * localLayers / 32
         let available = Int64(nl_available_memory())
-        let preferMetal = !settings.cpuOnly && (available == 0 || available > settings.model.bytes + overhead + photoBudget)
+        let preferMetal = !settings.cpuOnly && (available == 0 || available > localWeights + overhead + photoBudget)
         let useMetal = runtime != nil ? usesMetal : preferMetal
         let routes = useMetal ? [true, false] : [false]
 
@@ -211,11 +223,26 @@ final class LocalEngine: @unchecked Sendable {
         for metal in routes {
             var error = [CChar](repeating: 0, count: 512)
             let errorLength = error.count
-            let backend = metal ? "Metal" : "CPU"
+            let backend = shared != nil ? (metal ? "Metal + Windows" : "CPU + Windows") : (metal ? "Metal" : "CPU")
+            let link = shared.map { WindowsLink(device: $0.device, stop: stop) }
+            if let link {
+                continuation.yield(.loading("Windows link"))
+                do { try link.open() }
+                catch {
+                    if !stop.cancelled { throw error }
+                    continuation.yield(.finished(.stopped))
+                    return
+                }
+            }
             if runtime == nil {
                 continuation.yield(.loading(backend))
-                runtime = nl_open(settings.model.url.path, Int32(settings.context), metal, settings.cache.native,
-                                  stop.handle, &error, errorLength)
+                if let shared {
+                    runtime = nl_open_shared(settings.model.url.path, Int32(requestedContext), metal, settings.cache.native,
+                                             Int32(shared.layers), stop.handle, &error, errorLength)
+                } else {
+                    runtime = nl_open(settings.model.url.path, Int32(requestedContext), metal, settings.cache.native,
+                                      stop.handle, &error, errorLength)
+                }
                 if runtime != nil {
                     runtimeKey = key
                     usesMetal = metal
@@ -232,10 +259,19 @@ final class LocalEngine: @unchecked Sendable {
             }
 
             let context = Int(nl_context_window(runtime))
+            if let shared, let link {
+                continuation.yield(.loading("Windows layers"))
+                do { try link.prepare(layers: shared.layers, context: context) }
+                catch {
+                    if !stop.cancelled { throw error }
+                    continuation.yield(.finished(.stopped))
+                    return
+                }
+            }
             let cache = nl_context_cache(runtime) == 1 ? "Q4" : nl_context_cache(runtime) == 2 ? "Q8" : "F16"
             let profile = RuntimeProfile(backend: backend, context: context, cache: cache)
             continuation.yield(.ready(profile))
-            let reuse = settings.model.isPreset && !vision && settings.promptCache != .rebuild
+            let reuse = shared == nil && settings.model.isPreset && !vision && settings.promptCache != .rebuild
             if reuse, settings.promptCache == .storage, let activeConversation {
                 activeCheckpoint = checkpoints.location(conversation: activeConversation, profile: profile)
             } else {
@@ -256,7 +292,9 @@ final class LocalEngine: @unchecked Sendable {
                                        output_limit: Int32(request.limit),
                                        reuse_prompt: reuse,
                                        checkpoint_path: checkpoint.map { UnsafePointer($0) },
-                                       deterministic: false)
+                                       deterministic: false,
+                                       prefix: link == nil ? nil : requestWindowsPrefix,
+                                       prefix_user: link.map { Unmanaged.passUnretained($0).toOpaque() })
             var generated: Int32 = 0
             var finish: Int32 = 0
             var stats = NLPromptStats()
@@ -265,6 +303,7 @@ final class LocalEngine: @unchecked Sendable {
                             stop.handle, receiveChunk, receiveProgress, opaque,
                             &generated, &finish, &stats, &error, errorLength)
             }
+            if let failure = link?.failure, !stop.cancelled { throw failure }
             if status == NL_RETRY && metal && generated == 0 {
                 releaseRuntime()
                 continue

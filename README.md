@@ -1,10 +1,10 @@
 # Neth Local
 
-Neth Local runs GGUF models on the iPad with llama.cpp. It downloads the HauhauCS Qwen3.5 4B Uncensored Q4_K_M checkpoint and an optional vision projector from Hugging Face. Both downloads are pinned to a specific revision and checked by SHA-256 before installation. Chat and photo inference run on-device.
+Neth Local runs GGUF models on the iPad with llama.cpp. It downloads the HauhauCS Qwen3.5 4B Uncensored Q4_K_M checkpoint and an optional vision projector from Hugging Face. Both downloads are pinned to a specific revision and checked by SHA-256 before installation. The app supports local inference and shared text inference with a paired Windows computer.
 
 ## Build
 
-Run **Build iPad IPAs** in GitHub Actions and download the **NethLocal-iPad** artifact. For a local build on macOS with Xcode and the iPhoneOS SDK, run `bash scripts/build-ipa.sh`. The same files are written to `out/`.
+Run **Build Neth Local apps** in GitHub Actions. Download **NethLocal-iPad** for the IPAs and **NethLocal-Windows** for the standalone Windows companion. For a local iPad build on macOS with Xcode, CMake, and Python 3.12 or newer, run `bash scripts/build-ipa.sh`. The IPAs are written to `out/`.
 
 Both IPA filenames include the app version. For Impactor choose `NethLocal-v<version>-Impactor.ipa`, select **Signing → Apple ID**, leave the custom **Entitlements** field empty, and click **Install**. The app executable carries the Increased Memory Limit and Extended Virtual Addressing requests for Impactor to discover. Apple's provisioning profile determines which capabilities the signed app receives. The build also includes an unsigned package and the entitlement plist for other signing workflows. Both packages target ARM64 on iPadOS 18 and later. [Apple’s Increased Memory Limit documentation](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.kernel.increased-memory-limit)
 
@@ -16,9 +16,18 @@ Both IPA filenames include the app version. For Impactor choose `NethLocal-v<ver
 
 Use **Import GGUF** to add other decoder models with a llama.cpp-supported architecture and chat template. [Qwen checkpoint and license](https://huggingface.co/HauhauCS/Qwen3.5-4B-Uncensored-HauhauCS-Aggressive)
 
+## Share Qwen with Windows
+
+1. Run **NethLocal-Windows-v3.6.exe** on Windows 11 x64 and choose **Download model**. Download the bundled Qwen3.5 4B in the iPad app as well.
+2. In the Windows companion, open **Mobile Hotspot settings**. Set **Share over** to **Wi-Fi** and **Network band** to **5 GHz**. Turn on Mobile Hotspot, then choose **Start server**. The companion checks the selected band and listens on the hotspot adapter.
+3. Join the Windows hotspot on the iPad. In Neth Local, open **Models & context → Compute device → Pair Windows device**. Scan the Windows QR code and allow Local Network access. The Windows computer appears by name in the device list.
+4. Select the Windows computer and send a text prompt. **Layers on Windows** controls how many of the first 32 Qwen layers run on the laptop CPU. The iPad runs the remaining layers and samples the response. Check the composer for the measured token rate and use **This iPad** for a local comparison.
+
+Both devices read their own copy of the same model. The shared link carries token IDs and intermediate activations over TLS. The iPad verifies the certificate from the pairing code. Treat the QR code and the copied pairing code as credentials. Shared mode supports text and up to 32K context. Local mode supports photos and prompt checkpoints. The Windows companion uses an AVX2-capable x64 CPU. Single-reply speed depends on the two devices and network latency.
+
 ## Search, copy and history
 
-Enable **Web** for the next message to send a search query to DuckDuckGo, with Bing RSS as a fallback. The app passes compact snippets to the local model and shows clickable sources below its reply. The app sends the current query to the search provider. Chat history and photos stay with local inference.
+Enable **Web** for the next message to send a search query to DuckDuckGo, with Bing RSS as a fallback. The app passes compact snippets to the model and shows clickable sources below its reply. The app sends the current query to the search provider. The history database and photos are stored on the iPad. A shared reply sends the text context as token IDs to the paired laptop.
 
 Use **Copy** on a code block or **Copy reply** for the full answer. The sidebar saves conversations on disk, and **Search chats** can jump to earlier messages. The engine can recall matching excerpts from earlier in the current conversation.
 

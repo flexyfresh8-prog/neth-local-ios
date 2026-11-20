@@ -25,6 +25,7 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #endif
+#include "../Shared/QwenPartition.hpp"
 
 struct NLCancel {
     std::atomic<bool> requested{false};
@@ -42,6 +43,7 @@ struct NLRuntime {
     std::string projector;
     bool qwen = false;
     bool metal = false;
+    int32_t windows_layers = 0;
     int32_t cache = 3;
     NLWarmPrompt warm;
 
@@ -81,8 +83,8 @@ static int32_t threads() {
     return static_cast<int32_t>(std::clamp(std::thread::hardware_concurrency(), 2u, 4u));
 }
 
-NLRuntime *nl_open(const char *model_path, int32_t context, bool metal, int32_t cache,
-                  NLCancel *cancel, char *error, size_t error_size) {
+static NLRuntime *open_runtime(const char *model_path, int32_t context, bool metal, int32_t cache,
+                              int32_t windows_layers, NLCancel *cancel, char *error, size_t error_size) {
     static std::once_flag backend;
     std::call_once(backend, [] {
         llama_backend_init();
@@ -93,6 +95,7 @@ NLRuntime *nl_open(const char *model_path, int32_t context, bool metal, int32_t 
     auto runtime = std::make_unique<NLRuntime>();
     auto model_params = llama_model_default_params();
     model_params.n_gpu_layers = metal ? 999 : 0;
+    model_params.neth_partition = -windows_layers;
     model_params.load_mode = LLAMA_LOAD_MODE_MMAP;
     model_params.progress_callback = loading;
     model_params.progress_callback_user_data = cancel;
@@ -111,6 +114,12 @@ NLRuntime *nl_open(const char *model_path, int32_t context, bool metal, int32_t 
     llama_model_meta_val_str(runtime->model, "general.architecture", arch, sizeof(arch));
     runtime->qwen = std::strcmp(arch, "qwen35") == 0 || std::strcmp(arch, "qwen35moe") == 0;
     runtime->metal = metal;
+    runtime->windows_layers = windows_layers;
+    if (windows_layers && (std::strcmp(arch, "qwen35") != 0 ||
+        llama_model_n_layer(runtime->model) != neth::layers || llama_model_n_embd(runtime->model) != neth::width)) {
+        report(error, error_size, "Shared compute needs the bundled Qwen3.5 4B model.");
+        return nullptr;
+    }
     auto params = llama_context_default_params();
     params.n_batch = 128;
     params.n_ubatch = 128;
@@ -123,7 +132,9 @@ NLRuntime *nl_open(const char *model_path, int32_t context, bool metal, int32_t 
     constexpr size_t working_reserve = 268435456;
     // The Qwen3.5 4B checkpoint uses 32 KiB/token in F16 across its attention layers.
     const auto is_qwen_4b = runtime->qwen && llama_model_n_params(runtime->model) < 5'000'000'000ULL;
-    const size_t full_cache_per_token = is_qwen_4b ? 32768 : 131072;
+    const auto local_layers = neth::layers - windows_layers;
+    const auto local_bytes = [&](size_t full) { return full * local_layers / neth::layers; };
+    const size_t full_cache_per_token = is_qwen_4b ? local_bytes(32768) : 131072;
     const int32_t trained = llama_model_n_ctx_train(runtime->model);
     const int32_t start_window = trained > 0 ? std::min(context, trained) : context;
     const auto fits = [&](size_t bytes) {
@@ -139,7 +150,7 @@ NLRuntime *nl_open(const char *model_path, int32_t context, bool metal, int32_t 
             const int32_t preferred = cache != 0 ? cache : window >= 32768 ? 1 : window >= 4096 ? 2 : 3;
             for (int32_t mode = preferred; mode >= 1 && mode <= 2; --mode) {
                 if (mode != preferred && cache != 0) break;
-                if (!fits(size_t(window) * (mode == 1 ? 9216 : 17408))) continue;
+                if (!fits(size_t(window) * local_bytes(mode == 1 ? 9216 : 17408))) continue;
                 auto small_cache = params;
                 small_cache.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
                 small_cache.type_k = small_cache.type_v = mode == 1 ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0;
@@ -165,6 +176,21 @@ NLRuntime *nl_open(const char *model_path, int32_t context, bool metal, int32_t 
         return nullptr;
     }
     return runtime.release();
+}
+
+NLRuntime *nl_open(const char *model_path, int32_t context, bool metal, int32_t cache,
+                  NLCancel *cancel, char *error, size_t error_size) {
+    return open_runtime(model_path, context, metal, cache, 0, cancel, error, error_size);
+}
+
+NLRuntime *nl_open_shared(const char *model_path, int32_t context, bool metal, int32_t cache,
+                         int32_t windows_layers, NLCancel *cancel, char *error, size_t error_size) {
+    if (!neth::supported_prefix(windows_layers)) {
+        report(error, error_size, "Choose 4, 8, 12, or 16 Windows layers.");
+        return nullptr;
+    }
+    return open_runtime(model_path, std::min(context, neth::shared_context_limit), metal, cache,
+                        windows_layers, cancel, error, error_size);
 }
 
 void nl_close(NLRuntime *runtime) { delete runtime; }
@@ -432,7 +458,12 @@ int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
     const int32_t capacity = static_cast<int32_t>(llama_n_ctx_seq(context));
     const int32_t batch_size = static_cast<int32_t>(llama_n_batch(context));
     const bool text_qwen = runtime->qwen && picture == no_picture;
-    const bool reuse = text_qwen && options->reuse_prompt;
+    const bool shared = runtime->windows_layers != 0;
+    if (shared && (!options->prefix || picture != no_picture)) {
+        report(error, error_size, "Shared compute needs a Windows connection and a text-only prompt.");
+        return NL_ERROR;
+    }
+    const bool reuse = text_qwen && options->reuse_prompt && !shared;
     llama_set_abort_callback(context, stopped, cancel);
     struct ResetAbort {
         llama_context *context;
@@ -582,12 +613,36 @@ int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
 
     std::unique_ptr<llama_batch_ext, decltype(&llama_batch_ext_free)> batch(
         llama_batch_ext_init(context), llama_batch_ext_free);
+    std::vector<llama_token> prefix_tokens;
+    std::vector<float> activation;
+    if (shared) {
+        prefix_tokens.reserve(batch_size);
+        activation.resize(size_t(batch_size) * neth::width);
+    }
+    const auto clear_batch = [&] {
+        llama_batch_ext_clear(batch.get());
+        prefix_tokens.clear();
+    };
     const auto add_token = [&](llama_token token, bool logits) {
-        const auto index = llama_batch_ext_add_token(batch.get(), 0, token);
-        if (index < 0 || !llama_batch_ext_set_pos(batch.get(), index, &position)) return false;
-        if (logits && !llama_batch_ext_set_output_logits(batch.get(), index, true)) return false;
+        if (shared) {
+            prefix_tokens.push_back(token);
+        } else if (!neth::add_token(batch.get(), token, position, logits)) {
+            return false;
+        }
         ++position;
         return true;
+    };
+    const auto evaluate_batch = [&](bool logits) -> int32_t {
+        if (shared) {
+            const auto count = static_cast<int32_t>(prefix_tokens.size());
+            const auto start = position - count;
+            if (!options->prefix(prefix_tokens.data(), count, start, activation.data(), options->prefix_user)) return -10;
+            for (int32_t i = 0; i < count; ++i) {
+                if (!neth::add_activation(batch.get(), activation.data() + size_t(i) * neth::width,
+                                          start + i, logits && i + 1 == count)) return -1;
+            }
+        }
+        return llama_process(context, LLAMA_PROCESS_TYPE_DECODE, batch.get());
     };
     if (chunks) {
         if (!stopped(cancel)) {
@@ -598,11 +653,11 @@ int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
         const auto evaluate = [&](int32_t end) {
             while (position < end && !stopped(cancel)) {
                 const auto size = std::min(batch_size, end - position);
-                llama_batch_ext_clear(batch.get());
+                clear_batch();
                 for (int32_t i = 0; i < size; ++i) {
                     if (!add_token(tokens[position], position + 1 == used)) return false;
                 }
-                status = llama_process(context, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                status = evaluate_batch(position == used);
                 if (status != 0) break;
             }
             return true;
@@ -667,14 +722,14 @@ int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
         const bool eog = !force_close && llama_vocab_is_eog(vocab, token);
         if (deliberating && (force_close || eog)) {
             if (static_cast<int32_t>(closing_tokens.size()) >= steps - charged) break;
-            llama_batch_ext_clear(batch.get());
+            clear_batch();
             for (size_t i = 0; i < closing_tokens.size(); ++i) {
                 if (!add_token(closing_tokens[i], i + 1 == closing_tokens.size())) {
                     report(error, error_size, "The engine could not finish reasoning.");
                     return NL_ERROR;
                 }
             }
-            if (llama_process(context, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            if (evaluate_batch(true) != 0) {
                 runtime->warm = {};
                 if (stopped(cancel)) break;
                 report(error, error_size, "The engine could not finish reasoning.");
@@ -714,8 +769,8 @@ int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
         emit_text(pending, chunk, user);
         if (charged >= steps) break;
 
-        llama_batch_ext_clear(batch.get());
-        if (!add_token(token, true) || llama_process(context, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+        clear_batch();
+        if (!add_token(token, true) || evaluate_batch(true) != 0) {
             runtime->warm = {};
             if (stopped(cancel)) break;
             report(error, error_size, "The engine stopped while generating. Try a shorter context or CPU mode.");

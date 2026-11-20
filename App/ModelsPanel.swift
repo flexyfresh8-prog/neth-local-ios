@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 @MainActor
 struct ModelPanel: View {
     @ObservedObject var models: LocalModels
+    @ObservedObject var windows: WindowsDevices
     @Binding var context: Int
     @Binding var cpuOnly: Bool
     @Binding var thinking: Bool
@@ -25,6 +26,9 @@ struct ModelPanel: View {
     var body: some View {
         NavigationStack {
             List {
+                WindowsComputeSection(devices: windows, hasModel: models.has(.qwen), busy: inferenceBusy) {
+                    if let model = models.installed.first(where: { $0.isPreset }) { models.selectedID = model.id }
+                }
                 Section {
                     assetRow(.qwen, detail: "HauhauCS · Q4_K_M · \(LocalModels.size(ModelAsset.qwen.bytes))")
                     assetRow(.vision, detail: "Photos · \(LocalModels.size(ModelAsset.vision.bytes))")
@@ -102,7 +106,7 @@ struct ModelPanel: View {
                     Picker("Prompt reuse", selection: $promptCache) {
                         ForEach(PromptCacheMode.allCases) { mode in Text(mode.title).tag(mode) }
                     }
-                    .disabled(inferenceBusy || models.current?.isPreset != true)
+                    .disabled(inferenceBusy || models.current?.isPreset != true || windows.compute != nil)
                     if let metrics {
                         LabeledContent("Last prompt", value: metrics.source)
                         LabeledContent("Tokens reused", value: "\(metrics.reused.formatted()) / \(metrics.tokens.formatted())")
@@ -116,7 +120,7 @@ struct ModelPanel: View {
                     }
                     if promptCache == .storage {
                         Button("Save checkpoint and unload model") { Task { await saveAndUnload() } }
-                            .disabled(inferenceBusy || active == nil || models.current?.isPreset != true)
+                            .disabled(inferenceBusy || active == nil || models.current?.isPreset != true || windows.compute != nil)
                     }
                     Button("Clear saved checkpoints", role: .destructive) { Task { await clearCheckpoints() } }
                         .disabled(inferenceBusy)

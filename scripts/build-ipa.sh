@@ -3,11 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 root="$PWD"
-engine_tag=b12549
-engine_sha=8c87f76161bb1666e39686702744bb46f3945ce43b49d4be00d75b7001122f42
 work="$root/.build"
 output="$root/out"
-engine_dir="$work/$engine_tag"
 payload="$work/package/Payload"
 app="$payload/NethLocal.app"
 version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' App/Info.plist)"
@@ -16,20 +13,15 @@ unsigned="$output/NethLocal-v$version-unsigned.ipa"
 impactor="$output/NethLocal-v$version-Impactor.ipa"
 
 mkdir -p "$work" "$output"
-archive="$work/llama-$engine_tag-xcframework.zip"
-if [[ ! -f "$archive" ]] || ! printf '%s  %s\n' "$engine_sha" "$archive" | shasum -a 256 -c --status; then
-    curl --fail --location --retry 2 --connect-timeout 15 --max-time 180 \
-        --output "$archive.partial" \
-        "https://github.com/ggml-org/llama.cpp/releases/download/$engine_tag/llama-$engine_tag-xcframework.zip"
-    printf '%s  %s\n' "$engine_sha" "$archive.partial" | shasum -a 256 -c
-    mv "$archive.partial" "$archive"
+source="$(python3 scripts/prepare-engine.py)"
+framework="$source/build-ios-device/framework/llama.framework"
+if [[ ! -f "$framework/llama" ]]; then
+    (cd "$source" && bash build-xcframework.sh ios-device)
 fi
 
-rm -rf "$engine_dir" "$work/package"
-mkdir -p "$engine_dir" "$app/Frameworks"
-unzip -q "$archive" -d "$engine_dir"
-framework="$(find "$engine_dir" -type d -name llama.framework | awk '/\/ios-arm64\/llama\.framework$/')"
-test -d "$framework"
+rm -rf "$work/package"
+mkdir -p "$app/Frameworks"
+test -f "$framework/llama"
 ditto "$framework" "$app/Frameworks/llama.framework"
 cp App/Info.plist "$app/Info.plist"
 cp NethLocal.entitlements "$app/NethLocal.entitlements"
@@ -40,7 +32,8 @@ sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
 target="arm64-apple-ios18.0"
 
 xcrun --sdk iphoneos clang++ -target "$target" -isysroot "$sdk" -std=c++17 -O2 \
-    -F "$app/Frameworks" -c App/NethRuntime.cpp -o "$work/NethRuntime.o"
+    -I "$source/include" -I "$source/ggml/include" -I "$source/tools/mtmd" \
+    -c App/NethRuntime.cpp -o "$work/NethRuntime.o"
 
 xcrun --sdk iphoneos swiftc -target "$target" -sdk "$sdk" -swift-version 5 -O \
     -parse-as-library -module-name NethLocal -import-objc-header App/NethRuntime.h \

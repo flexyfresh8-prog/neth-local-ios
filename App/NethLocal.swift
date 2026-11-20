@@ -32,6 +32,7 @@ private struct ChatScreen: View {
     }
 
     @StateObject private var models = LocalModels()
+    @StateObject private var windows = WindowsDevices()
     @StateObject private var chat = LocalChat()
     @AppStorage("contextSize") private var context = 4096
     @AppStorage("cpuOnly") private var cpuOnly = false
@@ -62,7 +63,7 @@ private struct ChatScreen: View {
     private let readingWidth: CGFloat = 756
     private let composerWidth: CGFloat = 680
 
-    private var canAttach: Bool { models.current?.isPreset == true && models.projector != nil }
+    private var canAttach: Bool { models.current?.isPreset == true && models.projector != nil && windows.compute == nil }
     private var busy: Bool { chat.running || chat.opening }
     private var canSend: Bool {
         !busy && !loadingPhoto && (models.current != nil || quattro)
@@ -104,7 +105,7 @@ private struct ChatScreen: View {
                 }
                 .presentationDetents([.large])
             case .models:
-                ModelPanel(models: models, context: $context, cpuOnly: $cpuOnly,
+                ModelPanel(models: models, windows: windows, context: $context, cpuOnly: $cpuOnly,
                            thinking: $thinking, cache: $cache, compactHistory: $compactHistory,
                            promptCache: $promptCache, active: chat.profile, metrics: chat.promptMetrics,
                            checkpointNotice: chat.checkpointNotice, inferenceBusy: busy,
@@ -137,6 +138,11 @@ private struct ChatScreen: View {
         .onChange(of: sheet) { _, active in if active != nil { expandedPicker = nil } }
         .onChange(of: chat.running) { _, running in if running { expandedPicker = nil } }
         .onChange(of: models.selectedID) { _, _ in
+            chat.unload()
+            if models.current?.isPreset != true { windows.choose(nil) }
+            if !canAttach { clearAttachment() }
+        }
+        .onChange(of: windows.compute) { _, _ in
             chat.unload()
             if !canAttach { clearAttachment() }
         }
@@ -871,7 +877,8 @@ private struct ChatScreen: View {
         guard let model = models.current else { return nil }
         return EngineSettings(model: model, projector: canAttach ? models.projector : nil,
                               context: context, cpuOnly: cpuOnly, thinking: thinking,
-                              cache: cache, compactHistory: compactHistory, promptCache: promptCache)
+                              cache: cache, compactHistory: compactHistory, promptCache: promptCache,
+                              windows: model.isPreset ? windows.compute : nil)
     }
 
     private func continueReply(_ reply: ChatMessage) {
