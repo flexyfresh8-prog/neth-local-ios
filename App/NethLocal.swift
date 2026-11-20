@@ -18,7 +18,7 @@ struct NethLocalApp: App {
 @MainActor
 private struct ChatScreen: View {
     private enum Sheet: String, Identifiable {
-        case history, search, models
+        case history, search, models, tools
         var id: Self { self }
     }
 
@@ -27,34 +27,42 @@ private struct ChatScreen: View {
     @AppStorage("contextSize") private var context = 4096
     @AppStorage("cpuOnly") private var cpuOnly = false
     @AppStorage("thinking") private var thinking = false
+    @AppStorage("cachePrecision") private var cache = CachePrecision.automatic
+    @AppStorage("compactHistory") private var compactHistory = true
+    @AppStorage("effortPreset") private var effort = EffortPreset.balanced
+    @AppStorage("quattroEnabled") private var quattro = false
     @Environment(\.scenePhase) private var scene
     @FocusState private var typing: Bool
     @State private var draft = ""
     @State private var web = false
+    @State private var makeFiles = false
+    @State private var showSidebar = true
     @State private var sheet: Sheet?
     @State private var deleting: Conversation?
     @State private var photoItem: PhotosPickerItem?
     @State private var photo: URL?
     @State private var loadingPhoto = false
     @State private var nearBottom = true
+    @State private var exporting: ChatMessage?
+    @State private var exportName = "Reply.md"
 
     private var canAttach: Bool { models.current?.isPreset == true && models.projector != nil }
     private var busy: Bool { chat.running || chat.opening }
     private var canSend: Bool {
-        !busy && !loadingPhoto && models.current != nil
+        !busy && !loadingPhoto && (models.current != nil || quattro)
             && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || photo != nil)
     }
 
     var body: some View {
         GeometryReader { geometry in
-            let wide = geometry.size.width >= 868
+            let wide = geometry.size.width >= 835
             HStack(spacing: 0) {
-                if wide {
-                    sidebar(inSheet: false).frame(width: 254)
+                if wide && showSidebar {
+                    sidebar(inSheet: false).frame(width: 246)
                     Rectangle().fill(NethPalette.border).frame(width: 1)
                 }
                 VStack(spacing: 0) {
-                    header(showNavigation: !wide)
+                    header(wide: wide)
                     Rectangle().fill(NethPalette.border).frame(height: 1)
                     if chat.messages.isEmpty { startScreen } else { transcript }
                     composer
@@ -75,7 +83,15 @@ private struct ChatScreen: View {
                 .presentationDetents([.large])
             case .models:
                 ModelPanel(models: models, context: $context, cpuOnly: $cpuOnly,
-                           thinking: $thinking, inferenceBusy: busy) { chat.unload() }
+                           thinking: $thinking, cache: $cache, compactHistory: $compactHistory,
+                           active: chat.profile, inferenceBusy: busy) { chat.unload() }
+            case .tools:
+                QuattroPanel { tool in
+                    quattro = true
+                    if tool.id == "web.search" { web = true }
+                    draft = "/tool \(tool.id) \(tool.example)"
+                    typing = true
+                }
             }
         }
         .alert("Delete chat?", isPresented: Binding(
@@ -96,6 +112,17 @@ private struct ChatScreen: View {
             chat.unload()
             if !canAttach { clearAttachment() }
         }
+        .alert("Save reply", isPresented: Binding(
+            get: { exporting != nil }, set: { if !$0 { exporting = nil } }), presenting: exporting) { reply in
+                TextField("Filename", text: $exportName)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                Button("Save") {
+                    let name = exportName
+                    Task { await chat.saveReply(reply, as: name) }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: { _ in Text("Enter a filename such as Notes.md, Notes.txt or Notes.pdf.") }
         .onChange(of: models.projector) { _, _ in if !canAttach { clearAttachment() } }
         .onChange(of: scene) { _, phase in if phase == .background { chat.unload() } }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
@@ -146,6 +173,17 @@ private struct ChatScreen: View {
             .buttonStyle(.plain)
             .disabled(busy)
             .keyboardShortcut("f", modifiers: .command)
+
+            Button { sheet = .tools } label: {
+                Label("Quattro tools", systemImage: "square.grid.2x2")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(NethPalette.green)
+                    .frame(maxWidth: .infinity, minHeight: 39, alignment: .leading)
+                    .padding(.horizontal, 9)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(busy)
 
             if !chat.conversations.isEmpty {
                 Text("Recents")
@@ -208,10 +246,14 @@ private struct ChatScreen: View {
         }
     }
 
-    private func header(showNavigation: Bool) -> some View {
-        HStack(spacing: 11) {
-            if showNavigation {
-                iconControl("Chat history", symbol: "sidebar.left") { sheet = .history }
+    private func header(wide: Bool) -> some View {
+        HStack(spacing: 10) {
+            iconControl("Chat sidebar", symbol: "sidebar.left") {
+                if wide {
+                    withAnimation(.easeInOut(duration: 0.19)) { showSidebar.toggle() }
+                } else { sheet = .history }
+            }
+            if !wide {
                 iconControl("Search chats", symbol: "magnifyingglass") { sheet = .search }
                     .disabled(busy)
                     .keyboardShortcut("f", modifiers: .command)
@@ -221,7 +263,7 @@ private struct ChatScreen: View {
                     .font(.headline)
                     .lineLimit(1)
                     .foregroundStyle(.white)
-                Text(verbatim: models.current?.title ?? "Neth Local")
+                Text(verbatim: models.current?.isPreset == true ? "Qwen3.5 · 4B" : models.current?.title ?? "Neth Local")
                     .font(.caption)
                     .foregroundStyle(NethPalette.muted)
                     .lineLimit(1)
@@ -241,10 +283,12 @@ private struct ChatScreen: View {
                 }
                 .accessibilityElement(children: .combine)
             }
+            iconControl("New chat", symbol: "square.and.pencil", action: newChat).disabled(busy)
             iconControl("Models & context", symbol: "slider.horizontal.3") { sheet = .models }
         }
-        .padding(.horizontal, showNavigation ? 13 : 24)
+        .padding(.horizontal, wide ? 23 : 10)
         .frame(height: 63)
+        .background(NethPalette.rail.opacity(0.24))
     }
 
     private func iconControl(_ title: String, symbol: String, action: @escaping () -> Void) -> some View {
@@ -253,7 +297,7 @@ private struct ChatScreen: View {
                 .font(.system(size: 16, weight: .medium))
                 .foregroundStyle(NethPalette.accent)
                 .frame(width: 43, height: 43)
-                .background(NethPalette.surface, in: .rect(cornerRadius: 10))
+                .background(NethPalette.surface, in: .rect(cornerRadius: 13))
         }
         .buttonStyle(.plain)
         .accessibilityLabel(title)
@@ -280,18 +324,33 @@ private struct ChatScreen: View {
                 Button("Browse models") { sheet = .models }
                     .buttonStyle(.borderedProminent)
             } else {
-                Button {
-                    web = true
-                    typing = true
-                } label: {
-                    Label("Search the web", systemImage: "globe")
-                        .font(.subheadline.weight(.medium))
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 10) { quickActions }
+                    VStack(spacing: 9) { quickActions }
                 }
-                .buttonStyle(.bordered)
             }
         }
         .padding(22)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    @ViewBuilder
+    private var quickActions: some View {
+        Button {
+            quattro = true
+            makeFiles = true
+            typing = true
+        } label: {
+            Label("Create files", systemImage: "doc.badge.plus")
+        }
+        .buttonStyle(.bordered)
+        Button {
+            web = true
+            typing = true
+        } label: {
+            Label("Search the web", systemImage: "globe")
+        }
+        .buttonStyle(.bordered)
     }
 
     private var transcript: some View {
@@ -313,8 +372,10 @@ private struct ChatScreen: View {
                         .disabled(busy)
                     }
                     ForEach(chat.messages) { message in
-                        let active = message.id == -1 && chat.running
-                        ChatMessageRow(message: message, streaming: active, activity: active ? chat.activity : nil)
+                        let active = message.id == chat.activeReplyID && chat.running
+                        ChatMessageRow(message: message, streaming: active, activity: active ? chat.activity : nil,
+                                       allowActions: !busy,
+                                       resume: { continueReply(message) }, save: { saveReply(message) })
                             .equatable()
                             .id(message.id)
                     }
@@ -344,6 +405,9 @@ private struct ChatScreen: View {
             .onChange(of: chat.messages.last?.text) { _, _ in
                 if nearBottom && !chat.hasLater && chat.targetMessage == nil { reader.scrollTo("latest", anchor: .bottom) }
             }
+            .onChange(of: chat.activeReplyID) { _, active in
+                if let active, active != chat.messages.last?.id { reader.scrollTo(active, anchor: .center) }
+            }
             .onChange(of: chat.messages.last?.id) { _, _ in
                 if (nearBottom || chat.running) && !chat.hasLater && chat.targetMessage == nil {
                     reader.scrollTo("latest", anchor: .bottom)
@@ -368,116 +432,204 @@ private struct ChatScreen: View {
     }
 
     private var composer: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if let photo, let preview = UIImage(contentsOfFile: photo.path) {
-                HStack {
-                    Image(uiImage: preview).resizable().scaledToFill()
-                        .frame(width: 44, height: 44)
-                        .clipShape(.rect(cornerRadius: 7))
-                    Button("Remove photo", systemImage: "xmark.circle.fill") { clearAttachment() }
-                        .labelStyle(.iconOnly)
-                }
-                .padding(.horizontal, 7)
-            }
-            TextField(models.current == nil ? "Choose a model to start" : "Message Neth Local",
-                      text: $draft, axis: .vertical)
-                .textFieldStyle(.plain)
-                .lineLimit(1...7)
-                .focused($typing)
-                .disabled(models.current == nil)
-                .padding(.horizontal, 9)
-                .padding(.top, 6)
-                .frame(minHeight: 34)
-            HStack(spacing: 8) {
-                Button {
-                    web.toggle()
-                } label: {
-                    Label("Web", systemImage: "globe")
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(web ? NethPalette.green : NethPalette.muted)
-                        .padding(.horizontal, 10)
-                        .frame(minHeight: 39)
-                        .background(web ? NethPalette.green.opacity(0.13) : NethPalette.inset,
-                                    in: .rect(cornerRadius: 10))
-                        .overlay(RoundedRectangle(cornerRadius: 10)
-                            .strokeBorder(web ? NethPalette.green.opacity(0.33) : NethPalette.border))
-                }
-                .buttonStyle(.plain)
-                .disabled(models.current == nil || busy)
-                .accessibilityLabel("Web search")
-                .accessibilityValue(web ? "Enabled for next message" : "Off")
-                .accessibilityHint("When enabled, the next message is sent as a search query.")
-                if canAttach {
-                    PhotosPicker(selection: $photoItem, matching: .images) {
-                        Image(systemName: "photo")
-                            .foregroundStyle(NethPalette.muted)
-                            .frame(width: 40, height: 39)
-                            .background(NethPalette.inset, in: .rect(cornerRadius: 10))
+        VStack(alignment: .leading, spacing: 0) {
+            EffortMeter(preset: chat.activeEffort ?? effort, activity: chat.running ? chat.activity : nil,
+                        step: chat.effortStep, total: chat.effortTotal)
+                .padding(.horizontal, 15)
+                .padding(.top, 11)
+                .padding(.bottom, 8)
+            VStack(alignment: .leading, spacing: 8) {
+                if let photo, let preview = UIImage(contentsOfFile: photo.path) {
+                    HStack {
+                        Image(uiImage: preview).resizable().scaledToFill()
+                            .frame(width: 56, height: 56)
+                            .clipShape(.rect(cornerRadius: 9))
+                        Button("Remove photo", systemImage: "xmark.circle.fill") { clearAttachment() }
+                            .labelStyle(.iconOnly)
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Attach photo")
-                    .disabled(busy || loadingPhoto)
+                    .padding(.horizontal, 7)
                 }
-                Spacer(minLength: 4)
-                if web {
-                    Text("Search next message")
-                        .font(.caption)
-                        .foregroundStyle(NethPalette.muted)
-                        .lineLimit(1)
-                } else if let activity = chat.activity, chat.messages.last?.role != .assistant {
-                    Text(verbatim: activity).font(.caption).foregroundStyle(NethPalette.muted)
-                }
-                if chat.running {
-                    Button { chat.stop() } label: {
-                        Image(systemName: "stop.fill")
-                            .foregroundStyle(.white)
-                            .frame(width: 42, height: 42)
-                            .background(NethPalette.border, in: .rect(cornerRadius: 12))
+                TextField(models.current == nil && !quattro ? "Choose a model to start" : quattro ? "Message Quattro" : "Message Neth Local",
+                          text: $draft, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .lineLimit(1...7)
+                    .focused($typing)
+                    .disabled(models.current == nil && !quattro)
+                    .padding(.horizontal, 9)
+                    .padding(.top, 4)
+                    .frame(minHeight: 35)
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 6) {
+                        attachControl
+                        modeButtons
+                        Spacer(minLength: 2)
+                        effortMenu
+                        sendControl
                     }
-                    .accessibilityLabel("Stop")
-                    .buttonStyle(.plain)
-                } else {
-                    Button(action: send) {
-                        Image(systemName: "arrow.up")
-                            .font(.system(size: 17, weight: .bold))
-                            .foregroundStyle(canSend ? NethPalette.canvas : NethPalette.muted)
-                            .frame(width: 42, height: 42)
-                            .background(canSend ? NethPalette.accent : NethPalette.border, in: .rect(cornerRadius: 12))
+                    VStack(spacing: 2) {
+                        HStack(spacing: 6) { modeButtons; Spacer(minLength: 0) }
+                        HStack(spacing: 6) { attachControl; Spacer(minLength: 1); effortMenu; sendControl }
                     }
-                    .disabled(!canSend)
-                    .accessibilityLabel("Send")
-                    .buttonStyle(.plain)
-                    .keyboardShortcut(.return, modifiers: .command)
                 }
             }
+            .padding(.horizontal, 9)
+            .padding(.bottom, 8)
         }
-        .padding(9)
-        .background(NethPalette.surface, in: .rect(cornerRadius: 17))
-        .overlay(RoundedRectangle(cornerRadius: 17)
+        .background(NethPalette.surface, in: .rect(cornerRadius: 23))
+        .overlay(RoundedRectangle(cornerRadius: 23)
             .strokeBorder(typing ? NethPalette.accent.opacity(0.43) : NethPalette.border))
-        .frame(maxWidth: 810)
-        .padding(.horizontal, 17)
+        .frame(maxWidth: 795)
+        .padding(.horizontal, 14)
         .padding(.bottom, 13)
     }
 
+    @ViewBuilder
+    private var modeButtons: some View {
+        chip("Quattro", icon: "square.grid.2x2", active: quattro) {
+            quattro.toggle()
+            if !quattro { makeFiles = false }
+        }
+        .accessibilityHint("Enable the on-device tool agent for the main chat.")
+        chip("Web", icon: "globe", active: web) { web.toggle() }
+            .accessibilityHint("Send the next search query to the web search provider.")
+        chip("Files", icon: "doc.badge.plus", active: makeFiles) {
+            makeFiles.toggle()
+            if makeFiles { quattro = true }
+        }
+        .accessibilityHint("Create files from the next message.")
+    }
+
+    private func chip(_ label: String, icon: String, active: Bool, toggle: @escaping () -> Void) -> some View {
+        Button(action: toggle) {
+            Label(label, systemImage: icon)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(active ? NethPalette.green : NethPalette.muted)
+                .padding(.horizontal, 8)
+                .frame(minHeight: 40)
+                .background(active ? NethPalette.green.opacity(0.13) : NethPalette.inset, in: .rect(cornerRadius: 10))
+                .overlay(RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(active ? NethPalette.green.opacity(0.34) : NethPalette.border))
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        .buttonStyle(.plain)
+        .disabled(busy)
+        .accessibilityValue(active ? "On" : "Off")
+    }
+
+    private var attachControl: some View {
+        Menu {
+            if canAttach {
+                PhotosPicker(selection: $photoItem, matching: .images) {
+                    Label("Attach a photo", systemImage: "photo")
+                }
+            }
+            Button {
+                makeFiles = true
+                quattro = true
+                typing = true
+            } label: { Label("Create files with Quattro", systemImage: "doc.badge.plus") }
+            Button { sheet = .tools } label: {
+                Label("Browse \(ToolCatalog.shared.tools.count.formatted()) tools", systemImage: "square.grid.2x2")
+            }
+        } label: {
+            Image(systemName: "plus")
+                .font(.system(size: 17, weight: .medium))
+                .foregroundStyle(NethPalette.accent)
+                .frame(width: 39, height: 43)
+        }
+        .accessibilityLabel("Add to message")
+        .disabled(busy || loadingPhoto)
+    }
+
+    private var effortMenu: some View {
+        Menu {
+            ForEach(EffortPreset.allCases) { item in
+                Button { effort = item } label: {
+                    if effort == item {
+                        Label(item.title, systemImage: "checkmark")
+                    } else {
+                        Text(item.title)
+                    }
+                }
+            }
+            Text(effort.description)
+        } label: {
+            HStack(spacing: 5) {
+                Text(effort.title).lineLimit(1)
+                Image(systemName: "chevron.up.chevron.down").font(.system(size: 8, weight: .semibold))
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(NethPalette.accent)
+            .frame(minHeight: 41)
+            .padding(.horizontal, 5)
+            .fixedSize(horizontal: true, vertical: false)
+        }
+        .disabled(busy)
+        .accessibilityLabel("Effort")
+    }
+
+    @ViewBuilder
+    private var sendControl: some View {
+        if chat.running {
+            Button { chat.stop() } label: {
+                Image(systemName: "stop.fill")
+                    .foregroundStyle(.white)
+                    .frame(width: 43, height: 43)
+                    .background(NethPalette.border, in: .rect(cornerRadius: 12))
+            }
+            .accessibilityLabel("Stop and keep progress")
+            .buttonStyle(.plain)
+        } else {
+            Button(action: send) {
+                Image(systemName: "arrow.up")
+                    .font(.system(size: 17, weight: .bold))
+                    .foregroundStyle(canSend ? NethPalette.canvas : NethPalette.muted)
+                    .frame(width: 43, height: 43)
+                    .background(canSend ? NethPalette.accent : NethPalette.border, in: .rect(cornerRadius: 12))
+            }
+            .disabled(!canSend)
+            .accessibilityLabel("Send")
+            .buttonStyle(.plain)
+            .keyboardShortcut(.return, modifiers: .command)
+        }
+    }
+
     private func send() {
-        guard canSend, let model = models.current else { return }
+        guard canSend else { return }
         let text = draft.replacingOccurrences(of: "\0", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
-        if text.utf8.count > 64_000 {
+        if text.utf8.count > 280_000 {
             chat.problem = "This message is too long for the available context."
             return
         }
         guard !text.isEmpty || photo != nil else { return }
-        let settings = EngineSettings(model: model, projector: canAttach ? models.projector : nil,
-                                      context: context, cpuOnly: cpuOnly, thinking: thinking)
+        let allowWeb = !text.isEmpty && (web || (quattro && QuattroPlan.requestsWeb(text)))
+        let run = RunSettings(effort: effort, quattro: quattro, web: allowWeb, makeFiles: makeFiles)
         chat.send(text.isEmpty ? "Describe this image." : text, photo: photo,
-                  searchWeb: web && !text.isEmpty, settings: settings)
+                  runSettings: run, settings: engineSettings)
         photo = nil
         photoItem = nil
         web = false
+        makeFiles = false
         draft = ""
         typing = false
         nearBottom = true
+    }
+
+    private var engineSettings: EngineSettings? {
+        guard let model = models.current else { return nil }
+        return EngineSettings(model: model, projector: canAttach ? models.projector : nil,
+                              context: context, cpuOnly: cpuOnly, thinking: thinking,
+                              cache: cache, compactHistory: compactHistory)
+    }
+
+    private func continueReply(_ reply: ChatMessage) {
+        typing = false
+        chat.resume(reply, effort: effort, settings: engineSettings)
+    }
+
+    private func saveReply(_ reply: ChatMessage) {
+        exportName = "Reply.md"
+        exporting = reply
     }
 
     private func newChat() {
@@ -496,6 +648,7 @@ private struct ChatScreen: View {
     private func resetComposer() {
         draft = ""
         web = false
+        makeFiles = false
         nearBottom = true
         clearAttachment()
     }

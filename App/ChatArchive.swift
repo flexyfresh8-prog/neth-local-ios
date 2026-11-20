@@ -2,13 +2,14 @@ import Foundation
 import SQLite3
 
 struct ChatMessage: Identifiable, Equatable, Sendable {
-    enum Role: String, Sendable { case user, assistant }
+    enum Role: String, Codable, Sendable { case user, assistant }
     var id: Int64 = -1
     let role: Role
     var text: String
     var photo: URL? = nil
     var evidence: WebEvidence? = nil
     var notice: String? = nil
+    var metadata: ReplyMetadata? = nil
 }
 
 struct Conversation: Identifiable, Equatable, Sendable {
@@ -52,16 +53,17 @@ actor ChatArchive {
 
     func page(in id: String, before: Int64? = nil, limit: Int) throws -> [ChatMessage] {
         let data = try rows("""
-            SELECT id, role, body, photo, evidence, notice
+            SELECT id, role, body, photo, evidence, notice, reply_metadata
             FROM messages WHERE conversation_id = ? AND id < ?
             ORDER BY id DESC LIMIT ?
             """, [.text(id), .integer(before ?? .max), .integer(Int64(limit))]) { row in
             let evidence = optionalText(row, 4).flatMap { try? JSONDecoder().decode(WebEvidence.self, from: Data($0.utf8)) }
+            let metadata = optionalText(row, 6).flatMap { try? JSONDecoder().decode(ReplyMetadata.self, from: Data($0.utf8)) }
             return ChatMessage(id: sqlite3_column_int64(row, 0),
                                role: ChatMessage.Role(rawValue: text(row, 1)) ?? .assistant,
                                text: text(row, 2),
                                photo: optionalText(row, 3).map { photos.appending(path: $0) },
-                               evidence: evidence, notice: optionalText(row, 5))
+                               evidence: evidence, notice: optionalText(row, 5), metadata: metadata)
         }
         return data.reversed()
     }
@@ -82,20 +84,18 @@ actor ChatArchive {
             saved.photo = destination
         }
         do {
-            let evidence: Binding = try message.evidence.map {
-                .text(String(decoding: try JSONEncoder().encode($0), as: UTF8.self))
-            } ?? .null
+            let evidence = try encoded(message.evidence)
             try execute("BEGIN IMMEDIATE", db: db)
             let timestamp = Date().timeIntervalSince1970
             let title = message.text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
             try write("INSERT OR IGNORE INTO conversations (id, title, updated_at) VALUES (?, ?, ?)",
                       [.text(id), .text(title.isEmpty ? "New chat" : String(title.prefix(60))), .real(timestamp)])
             try write("""
-                INSERT INTO messages (conversation_id, role, body, photo, evidence, notice)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO messages (conversation_id, role, body, photo, evidence, notice, reply_metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, [.text(id), .text(message.role.rawValue), .text(message.text),
                       attachment.map { .text($0.lastPathComponent) } ?? .null,
-                      evidence, message.notice.map { .text($0) } ?? .null])
+                      evidence, message.notice.map { .text($0) } ?? .null, try encoded(message.metadata)])
             saved.id = sqlite3_last_insert_rowid(db)
             try write("UPDATE conversations SET updated_at = ? WHERE id = ?", [.real(timestamp), .text(id)])
             try execute("COMMIT", db: db)
@@ -105,6 +105,17 @@ actor ChatArchive {
             if let attachment { try? FileManager.default.removeItem(at: attachment) }
             throw error
         }
+    }
+
+    func updateReply(_ reply: ChatMessage, in id: String) throws {
+        guard reply.id > 0, reply.role == .assistant else { throw LocalError(message: "The reply has no saved checkpoint.") }
+        let db = try database()
+        try write("""
+            UPDATE messages SET body = ?, evidence = ?, notice = ?, reply_metadata = ?
+            WHERE conversation_id = ? AND id = ? AND role = 'assistant'
+            """, [.text(reply.text), try encoded(reply.evidence), reply.notice.map { .text($0) } ?? .null,
+                  try encoded(reply.metadata), .text(id), .integer(reply.id)])
+        guard sqlite3_changes(db) == 1 else { throw LocalError(message: "The reply could not be found in this conversation.") }
     }
 
     func delete(_ id: String) throws {
@@ -127,6 +138,33 @@ actor ChatArchive {
         let terms = Self.words(query).filter { $0.count >= 3 && !filler.contains($0.lowercased()) }
         guard !terms.isEmpty, before > 1 else { return [] }
         return try matches(terms, conversation: id, before: before, limit: 3)
+    }
+
+    func compact(in id: String, before cutoff: Int64) throws -> ContextDigest {
+        guard cutoff > 1 else { return ContextDigest() }
+        let stored = try rows("SELECT digest FROM conversation_digests WHERE conversation_id = ?", [.text(id)]) {
+            try? JSONDecoder().decode(ContextDigest.self, from: Data(text($0, 0).utf8))
+        }.first ?? nil
+        var digest = stored.flatMap { $0.through < cutoff ? $0 : nil } ?? ContextDigest()
+        let oldThrough = digest.through
+        // Bound work on a migrated chat. Subsequent sends advance this cursor incrementally.
+        let messages = try rows("""
+            SELECT id, role, body FROM (
+                SELECT id, role, body FROM messages
+                WHERE conversation_id = ? AND id > ? AND id < ?
+                ORDER BY id DESC LIMIT 160
+            ) ORDER BY id
+            """, [.text(id), .integer(digest.through), .integer(cutoff)]) { row in
+            (sqlite3_column_int64(row, 0), ChatMessage.Role(rawValue: text(row, 1)) ?? .assistant, text(row, 2))
+        }
+        for (message, role, text) in messages { digest.append(id: message, role: role, text: text) }
+        if digest.through > oldThrough {
+            try write("""
+                INSERT INTO conversation_digests (conversation_id, digest) VALUES (?, ?)
+                ON CONFLICT(conversation_id) DO UPDATE SET digest = excluded.digest
+                """, [.text(id), try encoded(digest)])
+        }
+        return digest
     }
 
     private static func words(_ text: String) -> [String] {
@@ -193,7 +231,12 @@ actor ChatArchive {
                     role TEXT NOT NULL, body TEXT NOT NULL, photo TEXT, evidence TEXT, notice TEXT
                 );
                 CREATE INDEX IF NOT EXISTS messages_by_conversation ON messages(conversation_id, id);
+                CREATE TABLE IF NOT EXISTS conversation_digests (
+                    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+                    digest TEXT NOT NULL
+                );
                 """, db: handle)
+            try addReplyMetadataIfNeeded(handle)
             do {
                 try execute("""
                     CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
@@ -203,6 +246,11 @@ actor ChatArchive {
                     END;
                     CREATE TRIGGER IF NOT EXISTS unindex_message AFTER DELETE ON messages BEGIN
                         INSERT INTO messages_fts(messages_fts, rowid, body) VALUES ('delete', old.id, old.body);
+                    END;
+                    CREATE TRIGGER IF NOT EXISTS refresh_message AFTER UPDATE OF body ON messages
+                    WHEN old.body IS NOT new.body BEGIN
+                        INSERT INTO messages_fts(messages_fts, rowid, body) VALUES ('delete', old.id, old.body);
+                        INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body);
                     END;
                     """, db: handle)
             } catch let error as LocalError where error.message.contains("no such module: fts5") {
@@ -214,6 +262,26 @@ actor ChatArchive {
         }
         connection = handle
         return handle
+    }
+
+    private func addReplyMetadataIfNeeded(_ db: OpaquePointer) throws {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "PRAGMA table_info(messages)", -1, &statement, nil) == SQLITE_OK,
+              let statement else { throw databaseError(db) }
+        var found = false
+        var result = sqlite3_step(statement)
+        while result == SQLITE_ROW {
+            if text(statement, 1) == "reply_metadata" { found = true }
+            result = sqlite3_step(statement)
+        }
+        sqlite3_finalize(statement)
+        guard result == SQLITE_DONE else { throw databaseError(db) }
+        if !found { try execute("ALTER TABLE messages ADD COLUMN reply_metadata TEXT", db: db) }
+    }
+
+    private func encoded<T: Encodable>(_ value: T?) throws -> Binding {
+        guard let value else { return .null }
+        return .text(String(decoding: try JSONEncoder().encode(value), as: UTF8.self))
     }
 
     private func execute(_ sql: String, db: OpaquePointer) throws {

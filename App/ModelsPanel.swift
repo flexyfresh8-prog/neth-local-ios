@@ -7,6 +7,9 @@ struct ModelPanel: View {
     @Binding var context: Int
     @Binding var cpuOnly: Bool
     @Binding var thinking: Bool
+    @Binding var cache: CachePrecision
+    @Binding var compactHistory: Bool
+    let active: RuntimeProfile?
     let inferenceBusy: Bool
     let unload: () -> Void
     @Environment(\.dismiss) private var dismiss
@@ -61,11 +64,23 @@ struct ModelPanel: View {
                         Text("4,096 tokens").tag(4096)
                         Text("8,192 tokens").tag(8192)
                         Text("16,384 tokens").tag(16384)
+                        Text("32,768 tokens").tag(32768)
+                        Text("65,536 tokens").tag(65536)
+                        Text("131,072 tokens").tag(131072)
                     }
+                    Picker("Cache precision", selection: $cache) {
+                        ForEach(CachePrecision.allCases) { mode in
+                            Text(mode.title).tag(mode)
+                        }
+                    }
+                    Toggle("Compact older chat turns", isOn: $compactHistory)
                     Toggle("Thinking mode", isOn: $thinking)
                     Toggle("CPU only", isOn: $cpuOnly)
+                    if let active {
+                        LabeledContent("Active context", value: active.detail)
+                    }
                 } header: { Text("Inference") } footer: {
-                    Text("Larger windows use a compact cache with the bundled Qwen model. The engine may reduce the window to fit available memory.")
+                    Text("Q4 and Q8 compress the bundled Qwen model’s active attention cache. iPadOS memory can reduce the actual context. Older chat excerpts are stored on disk.")
                     if available > 0 {
                         Text("iPadOS reports \(LocalModels.size(available)) of additional memory available to this app.")
                     }

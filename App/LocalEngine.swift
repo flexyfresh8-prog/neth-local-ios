@@ -7,16 +7,18 @@ struct EngineSettings: Equatable, Sendable {
     let context: Int
     let cpuOnly: Bool
     let thinking: Bool
+    let cache: CachePrecision
+    let compactHistory: Bool
 }
 
 struct RuntimeProfile: Equatable, Sendable {
     let backend: String
     let context: Int
-    let compactCache: Bool
+    let cache: String
 
     var detail: String {
         let window = context >= 1024 && context % 1024 == 0 ? "\(context / 1024)K" : "\(context)"
-        return compactCache ? "\(backend) · \(window) · Q8 cache" : "\(backend) · \(window)"
+        return "\(backend) · \(window) · \(cache)"
     }
 }
 
@@ -24,7 +26,19 @@ enum EngineEvent: Sendable {
     case loading(String)
     case ready(RuntimeProfile)
     case text(String)
-    case finished(count: Int, seconds: Double)
+    case finished(ReplyFinish, count: Int, seconds: Double)
+}
+
+struct ModelRequest: Sendable {
+    let history: [ChatMessage]
+    var evidence: WebEvidence? = nil
+    var recall: [TranscriptMatch] = []
+    var digest: ContextDigest? = nil
+    var instructions = ""
+    var prefix = ""
+    var grammar: String? = nil
+    var reasoning = 0
+    let limit: Int
 }
 
 final class GenerationStop: @unchecked Sendable {
@@ -55,6 +69,7 @@ final class LocalEngine: @unchecked Sendable {
         let context: Int
         let cpuOnly: Bool
         let vision: Bool
+        let cache: CachePrecision
     }
 
     private let work = DispatchQueue(label: "com.neth.local.inference", qos: .userInitiated)
@@ -66,15 +81,15 @@ final class LocalEngine: @unchecked Sendable {
 
     func unload() { work.async { self.releaseRuntime() } }
 
-    func stream(history: [ChatMessage], settings: EngineSettings, evidence: WebEvidence?,
-                recall: [TranscriptMatch], stop: GenerationStop)
+    func stream(_ request: ModelRequest, settings: EngineSettings, stop: GenerationStop)
         -> AsyncThrowingStream<EngineEvent, Error> {
         AsyncThrowingStream { continuation in
-            continuation.onTermination = { _ in stop.request() }
+            continuation.onTermination = { termination in
+                if case .cancelled = termination { stop.request() }
+            }
             work.async {
                 do {
-                    try self.generate(history: history, settings: settings, evidence: evidence, recall: recall,
-                                      stop: stop, continuation: continuation)
+                    try self.generate(request, settings: settings, stop: stop, continuation: continuation)
                     continuation.finish()
                 } catch { continuation.finish(throwing: error) }
             }
@@ -87,22 +102,22 @@ final class LocalEngine: @unchecked Sendable {
         runtimeKey = nil
     }
 
-    private func generate(history: [ChatMessage], settings: EngineSettings, evidence: WebEvidence?,
-                          recall: [TranscriptMatch], stop: GenerationStop,
+    private func generate(_ request: ModelRequest, settings: EngineSettings, stop: GenerationStop,
                           continuation: AsyncThrowingStream<EngineEvent, Error>.Continuation) throws {
-        let vision = settings.projector != nil && history.contains { $0.photo != nil }
-        let key = RuntimeKey(url: settings.model.url, context: settings.context, cpuOnly: settings.cpuOnly, vision: vision)
+        let vision = settings.projector != nil && request.history.contains { $0.photo != nil }
+        let key = RuntimeKey(url: settings.model.url, context: settings.context, cpuOnly: settings.cpuOnly,
+                             vision: vision, cache: settings.cache)
         if runtimeKey != key { releaseRuntime() }
 
         let photoBudget: Int64 = vision ? 1_210_000_000 : 0
-        let cacheBudget: Int64 = settings.model.isPreset ? 19_000 : 65_536
+        let cacheBudget: Int64 = settings.model.isPreset ? settings.cache.bytesPerToken(at: settings.context) : 131_072
         let overhead: Int64 = 440_000_000 + Int64(settings.context) * cacheBudget
         let available = Int64(nl_available_memory())
         let preferMetal = !settings.cpuOnly && (available == 0 || available > settings.model.bytes + overhead + photoBudget)
         let useMetal = runtime != nil ? usesMetal : preferMetal
         let routes = useMetal ? [true, false] : [false]
 
-        let strings = history.map { message in
+        let strings = request.history.map { message in
             [strdup(message.role.rawValue), strdup(message.text),
              vision ? message.photo.map { strdup($0.path) } ?? nil : nil]
         }
@@ -124,7 +139,8 @@ final class LocalEngine: @unchecked Sendable {
             let backend = metal ? "Metal" : "CPU"
             if runtime == nil {
                 continuation.yield(.loading(backend))
-                runtime = nl_open(settings.model.url.path, Int32(settings.context), metal, stop.handle, &error, errorLength)
+                runtime = nl_open(settings.model.url.path, Int32(settings.context), metal, settings.cache.native,
+                                  stop.handle, &error, errorLength)
                 if runtime != nil {
                     runtimeKey = key
                     usesMetal = metal
@@ -138,34 +154,51 @@ final class LocalEngine: @unchecked Sendable {
             }
 
             let context = Int(nl_context_window(runtime))
-            continuation.yield(.ready(RuntimeProfile(backend: backend, context: context,
-                                                      compactCache: nl_context_compact(runtime))))
-            let reference = referenceText(context: context, evidence: evidence, recall: recall)
+            let cache = nl_context_cache(runtime) == 1 ? "Q4" : nl_context_cache(runtime) == 2 ? "Q8" : "F16"
+            continuation.yield(.ready(RuntimeProfile(backend: backend, context: context, cache: cache)))
+            let reference = referenceText(context: context, evidence: request.evidence, recall: request.recall,
+                                          digest: request.digest, instructions: request.instructions)
+            let referencePointer = strdup(reference)
+            let prefix = strdup(ReplyContinuation.tail(of: request.prefix, context: context))
+            let grammar = request.grammar.flatMap { strdup($0) }
+            defer { free(referencePointer); free(prefix); free(grammar) }
+            var options = NLGeneration(projector_path: projector.map { UnsafePointer($0) },
+                                       reference: referencePointer.map { UnsafePointer($0) },
+                                       assistant_prefix: prefix.map { UnsafePointer($0) },
+                                       grammar: grammar.map { UnsafePointer($0) },
+                                       reasoning_budget: Int32(request.reasoning),
+                                       output_limit: Int32(request.limit))
             var generated: Int32 = 0
-            let maxTokens: Int32 = settings.thinking ? (context >= 4096 ? 1408 : 640)
-                                                    : (context >= 4096 ? 1024 : 384)
+            var finish: Int32 = 0
             let status = messages.withUnsafeBufferPointer { messages in
-                nl_generate(runtime, messages.baseAddress, messages.count,
-                            projector.map { UnsafePointer($0) }, reference, settings.thinking, maxTokens,
-                            stop.handle, receiveChunk, opaque, &generated, &error, errorLength)
+                nl_generate(runtime, messages.baseAddress, messages.count, &options,
+                            stop.handle, receiveChunk, opaque, &generated, &finish, &error, errorLength)
             }
-            if status == NL_STOPPED { return }
             if status == NL_RETRY && metal && generated == 0 {
                 releaseRuntime()
                 continue
             }
-            guard status == NL_OK else {
+            guard status == NL_OK || status == NL_STOPPED else {
                 let message = String(cString: error)
                 throw LocalError(message: message.isEmpty ? "Local generation failed." : message)
             }
             let elapsed = max(0.001, ProcessInfo.processInfo.systemUptime - (sink.firstToken ?? start))
-            if generated > 1 { continuation.yield(.finished(count: Int(generated), seconds: elapsed)) }
+            let reason: ReplyFinish
+            switch finish {
+            case Int32(NL_FINISH_OUTPUT): reason = .outputLimit
+            case Int32(NL_FINISH_CONTEXT): reason = .contextLimit
+            case Int32(NL_FINISH_STOPPED): reason = .stopped
+            default: reason = .complete
+            }
+            continuation.yield(.finished(reason, count: Int(generated), seconds: elapsed))
             return
         }
     }
 
-    private func referenceText(context: Int, evidence: WebEvidence?, recall: [TranscriptMatch]) -> String {
+    private func referenceText(context: Int, evidence: WebEvidence?, recall: [TranscriptMatch], digest: ContextDigest?,
+                               instructions: String) -> String {
         var sections: [String] = []
+        if !instructions.isEmpty { sections.append(instructions) }
         func excerpt(_ text: String, limit: Int) -> String {
             let clean = text.replacingOccurrences(of: "<", with: "‹")
                             .replacingOccurrences(of: ">", with: "›")
@@ -185,6 +218,12 @@ final class LocalEngine: @unchecked Sendable {
             let notes = recall.map { "\($0.role.rawValue): \(excerpt($0.excerpt, limit: limit))" }
             sections.append("Relevant earlier turns from this conversation follow as quoted context.\n"
                             + notes.joined(separator: "\n"))
+        }
+        if let digest, context >= 2048 {
+            let summary = digest.excerpt(limit: min(1200, context / 5))
+            if !summary.isEmpty {
+                sections.append("Compacted older chat excerpts for background:\n\(excerpt(summary, limit: 1200))")
+            }
         }
         return sections.joined(separator: "\n\n")
     }

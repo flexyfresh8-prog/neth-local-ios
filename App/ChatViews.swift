@@ -2,20 +2,28 @@ import SwiftUI
 import UIKit
 
 enum NethPalette {
-    static let canvas = Color(red: 0.055, green: 0.062, blue: 0.086)
-    static let rail = Color(red: 0.086, green: 0.093, blue: 0.126)
-    static let surface = Color(red: 0.108, green: 0.117, blue: 0.160)
-    static let inset = Color(red: 0.068, green: 0.075, blue: 0.105)
-    static let border = Color(red: 0.175, green: 0.184, blue: 0.237)
-    static let muted = Color(red: 0.63, green: 0.67, blue: 0.77)
-    static let accent = Color(red: 0.73, green: 0.70, blue: 1)
-    static let green = Color(red: 0.65, green: 0.89, blue: 0.80)
+    static let canvas = Color(red: 0.048, green: 0.053, blue: 0.072)
+    static let rail = Color(red: 0.074, green: 0.080, blue: 0.111)
+    static let surface = Color(red: 0.10, green: 0.112, blue: 0.155)
+    static let inset = Color(red: 0.060, green: 0.066, blue: 0.09)
+    static let border = Color(red: 0.185, green: 0.194, blue: 0.26)
+    static let muted = Color(red: 0.66, green: 0.70, blue: 0.79)
+    static let accent = Color(red: 0.77, green: 0.69, blue: 1)
+    static let green = Color(red: 0.57, green: 0.92, blue: 0.81)
 }
 
 struct ChatMessageRow: View, Equatable {
     let message: ChatMessage
     let streaming: Bool
     let activity: String?
+    let allowActions: Bool
+    let resume: () -> Void
+    let save: () -> Void
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.message == rhs.message && lhs.streaming == rhs.streaming && lhs.activity == rhs.activity
+            && lhs.allowActions == rhs.allowActions
+    }
 
     var body: some View {
         if message.role == .user {
@@ -50,7 +58,7 @@ struct ChatMessageRow: View, Equatable {
     private var assistantMessage: some View {
         let content = ReplyFormat(message.text)
         return HStack(alignment: .top, spacing: 12) {
-            Image(systemName: "waveform")
+            Image(systemName: message.metadata?.quattro == true ? "square.grid.2x2" : "waveform")
                 .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(NethPalette.accent)
                 .frame(width: 29, height: 29)
@@ -92,13 +100,58 @@ struct ChatMessageRow: View, Equatable {
                     }
                 }
                 if let evidence = message.evidence { sources(evidence) }
+                if let metadata = message.metadata {
+                    ForEach(metadata.files) { WorkspaceFileCard(file: $0) }
+                    if !metadata.trace.isEmpty {
+                        DisclosureGroup {
+                            VStack(alignment: .leading, spacing: 9) {
+                                ForEach(metadata.trace) { item in
+                                    Label(item.title, systemImage: item.failed ? "exclamationmark.circle" : "checkmark.circle")
+                                        .foregroundStyle(item.failed ? NethPalette.accent : NethPalette.green)
+                                    Text(verbatim: item.detail)
+                                        .foregroundStyle(NethPalette.muted)
+                                        .textSelection(.enabled)
+                                }
+                            }
+                            .padding(.top, 7)
+                        } label: {
+                            Label("Quattro activity · \(metadata.trace.count)", systemImage: "square.grid.2x2")
+                        }
+                        .font(.footnote)
+                    }
+                }
                 if !content.answer.isEmpty && !streaming {
-                    CopyControl(content: content.answer, accessibilityTitle: "Copy reply", compact: true)
+                    HStack(spacing: 8) {
+                        CopyControl(content: content.answer, accessibilityTitle: "Copy reply", compact: true)
+                        Button(action: save) {
+                            Label("Save as file", systemImage: "doc.badge.plus")
+                                .font(.caption.weight(.semibold))
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(!allowActions)
+                    }
+                }
+                if !streaming, let reason = message.metadata?.finish.label ?? (content.hasOpenFence ? "Open code block" : nil) {
+                    ViewThatFits(in: .horizontal) {
+                        HStack { Text(verbatim: reason); resumeButton }
+                        VStack(alignment: .leading, spacing: 5) { Text(verbatim: reason); resumeButton }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(NethPalette.muted)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.top, 3)
         }
+    }
+
+    private var resumeButton: some View {
+        Button(action: resume) {
+            Label("Continue", systemImage: "arrow.right.circle")
+                .font(.caption.weight(.semibold))
+        }
+        .buttonStyle(.bordered)
+        .disabled(!allowActions)
     }
 
     private func sources(_ evidence: WebEvidence) -> some View {

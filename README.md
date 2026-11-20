@@ -11,7 +11,7 @@ For Impactor choose `NethLocal-Impactor.ipa`, select **Signing → Apple ID**, l
 ## Run a model
 
 1. Open **Models** and download **Qwen3.5 4B Uncensored**. The download is 2.71 GB.
-2. Close **Models** and send a message. The default context is 4K, with settings from 512 tokens to 16K. Qwen can use a Q8 attention cache for larger windows. Available memory can reduce the active window, which the chat header shows along with the compute backend.
+2. Close **Models** and send a message. **Settings → Inference** offers context requests from 512 to 131,072 tokens. Select Automatic, Q4, Q8 or F16 cache precision. The header reports the active window, cache and backend after the engine allocates memory.
 3. To attach a photo, download **Qwen vision projector** (676 MB) and use the photo button next to the message field. Photo inference needs more memory than text chat. Text and still images are supported.
 
 Use **Import GGUF** to add other decoder models with a llama.cpp-supported architecture and chat template. [Qwen checkpoint and license](https://huggingface.co/HauhauCS/Qwen3.5-4B-Uncensored-HauhauCS-Aggressive)
@@ -22,4 +22,12 @@ Enable **Web** for the next message to send a search query to DuckDuckGo, with B
 
 Use **Copy** on a code block or **Copy reply** for the full answer. The sidebar saves conversations on disk, and **Search chats** can jump to earlier messages. The engine can recall matching excerpts from earlier in the current conversation.
 
-Model weights use file-backed memory mapping. The database stores and searches older turns. The active context and attention cache still use device memory.
+Model weights use file-backed memory mapping. The database stores transcripts and incremental excerpts of older turns. **Compact older chat turns** adds a short digest to the prompt. The active attention cache uses device memory.
+
+## Quattro and effort
+
+Enable **Quattro** in the main composer. It can choose tools for calculations, text and data transforms, dates, conversions, and search. The catalog distinguishes general actions from specific unit conversions. Choose an entry in **Quattro tools** to put an editable command in the composer. Use **Web** to send the current query to the search provider.
+
+Use the **Effort** menu to choose Quick, Balanced, Deep or Max. The bar shows the current phase and step. If a reply hits a token or context limit, the app can continue from a bounded trailing excerpt. Tap **Continue** to resume a saved reply after stopping or reaching the effort limit.
+
+Tap **Files** and describe a file or project, or type `/file Notes.pdf Summarize the topic ...`. Quattro plans the files, saves them inside the conversation and creates a ZIP for multi-file projects. Open file cards for a preview or use Share to save them to Files. **Save as file** on an existing answer also supports Markdown, text and PDF.

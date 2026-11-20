@@ -10,6 +10,7 @@ struct ReplyFormat {
     let reasoning: String?
     let reasoningComplete: Bool
     let blocks: [ReplyBlock]
+    let hasOpenFence: Bool
 
     init(_ output: String) {
         let text = output.replacingOccurrences(of: "\r\n", with: "\n")
@@ -29,10 +30,10 @@ struct ReplyFormat {
             answer = text.trimmingCharacters(in: .whitespacesAndNewlines)
             reasoningComplete = true
         }
-        blocks = Self.parse(answer)
+        (blocks, hasOpenFence) = Self.parse(answer)
     }
 
-    private static func parse(_ answer: String) -> [ReplyBlock] {
+    private static func parse(_ answer: String) -> ([ReplyBlock], Bool) {
         var result: [ReplyBlock] = []
         var lines: [Substring] = []
         var fence: (marker: Character, length: Int, language: String)?
@@ -66,6 +67,6 @@ struct ReplyFormat {
             let remaining = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
             if !remaining.isEmpty { result.append(.prose(remaining)) }
         }
-        return result
+        return (result, fence != nil)
     }
 }

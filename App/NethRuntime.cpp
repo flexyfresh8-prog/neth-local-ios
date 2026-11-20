@@ -35,7 +35,7 @@ struct NLRuntime {
     std::string projector;
     bool qwen = false;
     bool metal = false;
-    bool compact_kv = false;
+    int32_t cache = 3;
 
     ~NLRuntime() {
         if (vision) mtmd_free(vision);
@@ -72,7 +72,7 @@ static int32_t threads() {
     return static_cast<int32_t>(std::clamp(std::thread::hardware_concurrency(), 2u, 4u));
 }
 
-NLRuntime *nl_open(const char *model_path, int32_t context, bool metal,
+NLRuntime *nl_open(const char *model_path, int32_t context, bool metal, int32_t cache,
                   NLCancel *cancel, char *error, size_t error_size) {
     static std::once_flag backend;
     std::call_once(backend, [] {
@@ -115,21 +115,34 @@ NLRuntime *nl_open(const char *model_path, int32_t context, bool metal,
     // The Qwen3.5 4B checkpoint uses 32 KiB/token in F16 across its attention layers.
     const auto is_qwen_4b = runtime->qwen && llama_model_n_params(runtime->model) < 5'000'000'000ULL;
     const size_t full_cache_per_token = is_qwen_4b ? 32768 : 131072;
-    for (int32_t window = context; !stopped(cancel); window /= 2) {
-        const bool compact = is_qwen_4b && window >= 4096;
+    const int32_t trained = llama_model_n_ctx_train(runtime->model);
+    const int32_t start_window = trained > 0 ? std::min(context, trained) : context;
+    const auto fits = [&](size_t bytes) {
+        #ifdef __APPLE__
+        return available > working_reserve + bytes;
+        #else
+        return !available || available > working_reserve + bytes;
+        #endif
+    };
+    for (int32_t window = start_window; !stopped(cancel); window /= 2) {
         params.n_ctx = window;
-        if (compact && (!available || available > working_reserve + size_t(window) * 18432)) {
-            auto small_cache = params;
-            small_cache.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-            small_cache.type_k = GGML_TYPE_Q8_0;
-            small_cache.type_v = GGML_TYPE_Q8_0;
-            runtime->context = llama_init_from_model(runtime->model, small_cache);
-            if (runtime->context) {
-                runtime->compact_kv = true;
-                break;
+        if (is_qwen_4b && cache != 3) {
+            const int32_t preferred = cache != 0 ? cache : window >= 32768 ? 1 : window >= 4096 ? 2 : 3;
+            for (int32_t mode = preferred; mode >= 1 && mode <= 2; --mode) {
+                if (mode != preferred && cache != 0) break;
+                if (!fits(size_t(window) * (mode == 1 ? 9216 : 17408))) continue;
+                auto small_cache = params;
+                small_cache.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+                small_cache.type_k = small_cache.type_v = mode == 1 ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0;
+                runtime->context = llama_init_from_model(runtime->model, small_cache);
+                if (runtime->context) {
+                    runtime->cache = mode;
+                    break;
+                }
             }
+            if (runtime->context) break;
         }
-        if (window <= 1024 || !available || available > working_reserve + size_t(window) * full_cache_per_token) {
+        if (window <= 1024 || fits(size_t(window) * full_cache_per_token)) {
             runtime->context = llama_init_from_model(runtime->model, params);
             if (runtime->context) break;
         }
@@ -145,10 +158,10 @@ NLRuntime *nl_open(const char *model_path, int32_t context, bool metal,
 
 void nl_close(NLRuntime *runtime) { delete runtime; }
 int32_t nl_context_window(const NLRuntime *runtime) { return llama_n_ctx_seq(runtime->context); }
-bool nl_context_compact(const NLRuntime *runtime) { return runtime->compact_kv; }
+int32_t nl_context_cache(const NLRuntime *runtime) { return runtime->cache; }
 
 static std::string qwen_prompt(const NLMessage *messages, size_t first, size_t count,
-                               size_t picture, const char *reference, bool thinking) {
+                               size_t picture, const char *reference, bool thinking, const std::string &prefix) {
     std::string prompt;
     if (reference && *reference) {
         prompt = "<|im_start|>system\n";
@@ -176,11 +189,12 @@ static std::string qwen_prompt(const NLMessage *messages, size_t first, size_t c
     }
     prompt += "<|im_start|>assistant\n<think>\n";
     if (!thinking) prompt += "\n</think>\n\n";
+    prompt += prefix;
     return prompt;
 }
 
 static std::string model_prompt(const NLRuntime &runtime, const NLMessage *messages,
-                                size_t first, size_t count, const char *reference) {
+                                size_t first, size_t count, const char *reference, const std::string &prefix) {
     std::vector<llama_chat_message> chat;
     for (size_t i = first; i < count; ++i) chat.push_back({messages[i].role, messages[i].text});
     // Some imported chat templates do not accept a separate system role.
@@ -200,16 +214,18 @@ static std::string model_prompt(const NLRuntime &runtime, const NLMessage *messa
                                                    prompt.data(), static_cast<int32_t>(prompt.size()));
     if (written != size) return {};
     prompt.resize(size);
+    prompt += prefix;
     return prompt;
 }
 
-static std::vector<llama_token> tokenize(const llama_vocab *vocab, const std::string &prompt) {
+static std::vector<llama_token> tokenize(const llama_vocab *vocab, const std::string &prompt,
+                                         bool add_special = true) {
     const auto count = -llama_tokenize(vocab, prompt.data(), static_cast<int32_t>(prompt.size()),
-                                       nullptr, 0, true, true);
+                                       nullptr, 0, add_special, true);
     if (count <= 0) return {};
     std::vector<llama_token> tokens(count);
     const auto written = llama_tokenize(vocab, prompt.data(), static_cast<int32_t>(prompt.size()),
-                                         tokens.data(), count, true, true);
+                                         tokens.data(), count, add_special, true);
     if (written != count) return {};
     return tokens;
 }
@@ -232,12 +248,19 @@ static void emit_text(std::string &pending, NLChunk chunk, void *user, bool fina
 }
 
 int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
-                    const char *projector_path, const char *reference, bool thinking, int32_t output_limit,
+                    const NLGeneration *options,
                     NLCancel *cancel, NLChunk chunk, void *user, int32_t *generated,
-                    char *error, size_t error_size) {
+                    int32_t *finish, char *error, size_t error_size) {
     *generated = 0;
+    *finish = NL_FINISH_STOPPED;
     if (stopped(cancel)) return NL_STOPPED;
-    if (!count) return NL_ERROR;
+    if (!count || !options || options->output_limit < 1) return NL_ERROR;
+    const auto *projector_path = options->projector_path;
+    const auto *reference = options->reference;
+    const int32_t output_limit = options->output_limit;
+    const bool structured = options->grammar && *options->grammar;
+    std::string prefix = options->assistant_prefix ? options->assistant_prefix : "";
+    const bool thinking = runtime->qwen && options->reasoning_budget > 0 && prefix.empty() && !structured;
 
     constexpr auto no_picture = static_cast<size_t>(-1);
     size_t picture = no_picture;
@@ -305,12 +328,12 @@ int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
         mtmd_input_chunks_init(), mtmd_input_chunks_free);
     size_t first = 0;
     int32_t used = 0;
-    const int32_t reserve = std::min(output_limit, 128);
+    const int32_t reserve = std::min(output_limit, std::max(96, capacity / 4));
     for (;;) {
         if (stopped(cancel)) return NL_STOPPED;
         const auto active_picture = picture != no_picture && picture >= first ? picture : no_picture;
-        auto prompt = runtime->qwen ? qwen_prompt(messages, first, count, active_picture, reference, thinking)
-                                    : model_prompt(*runtime, messages, first, count, reference);
+        auto prompt = runtime->qwen ? qwen_prompt(messages, first, count, active_picture, reference, thinking, prefix)
+                                    : model_prompt(*runtime, messages, first, count, reference, prefix);
         if (prompt.empty()) {
             report(error, error_size, "The engine does not recognize this model’s chat template.");
             return NL_ERROR;
@@ -331,6 +354,12 @@ int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
         }
         if (used <= 0 || used > capacity - 8) {
             if (first + 1 == count) {
+                if (!prefix.empty()) {
+                    size_t start = (prefix.size() + 1) / 2;
+                    while (start < prefix.size() && (static_cast<unsigned char>(prefix[start]) & 0xc0) == 0x80) ++start;
+                    prefix.erase(0, start);
+                    continue;
+                }
                 report(error, error_size, "The latest message is too long for this context. Shorten it or increase the context in Models.");
                 return NL_ERROR;
             }
@@ -376,30 +405,81 @@ int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
 
     std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)> sampler(
         llama_sampler_chain_init(llama_sampler_chain_default_params()), llama_sampler_free);
+    if (structured) {
+        auto *grammar = llama_sampler_init_grammar(vocab, options->grammar, "root");
+        if (!grammar) {
+            report(error, error_size, "The engine could not prepare the tool-call grammar.");
+            return NL_ERROR;
+        }
+        llama_sampler_chain_add(sampler.get(), grammar);
+    }
     llama_sampler_chain_add(sampler.get(), llama_sampler_init_top_k(20));
     llama_sampler_chain_add(sampler.get(), llama_sampler_init_top_p(thinking ? 0.95f : 0.80f, 1));
-    llama_sampler_chain_add(sampler.get(), llama_sampler_init_temp(thinking ? 0.60f : 0.70f));
+    llama_sampler_chain_add(sampler.get(), llama_sampler_init_temp(structured ? 0.15f : thinking ? 0.60f : 0.70f));
     llama_sampler_chain_add(sampler.get(), llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
-    const int32_t steps = std::min(output_limit, capacity - used);
+    const int32_t window_left = capacity - used;
+    const int32_t steps = std::min(output_limit, window_left);
+    const int32_t reasoning_limit = std::min(options->reasoning_budget, steps / 3);
+    const std::string closing = "\n</think>\n\n";
+    const auto closing_tokens = thinking ? tokenize(vocab, closing, false) : std::vector<llama_token>{};
+    bool deliberating = thinking && !closing_tokens.empty();
+    std::string thought_tail;
     std::string pending;
-    for (int32_t i = 0; i < steps && !stopped(cancel); ++i) {
-        const llama_token token = llama_sampler_sample(sampler.get(), context, -1);
-        if (llama_vocab_is_eog(vocab, token)) break;
-        if (i == 0 && thinking && runtime->qwen) pending += "<think>\n";
-
+    if (thinking) {
+        pending = "<think>\n";
+        emit_text(pending, chunk, user);
+    }
+    *finish = window_left <= output_limit ? NL_FINISH_CONTEXT : NL_FINISH_OUTPUT;
+    int32_t charged = 0;
+    while (charged < steps && !stopped(cancel)) {
+        const bool force_close = deliberating && *generated >= reasoning_limit;
+        const auto token = force_close ? LLAMA_TOKEN_NULL : llama_sampler_sample(sampler.get(), context, -1);
+        const bool eog = !force_close && llama_vocab_is_eog(vocab, token);
+        if (deliberating && (force_close || eog)) {
+            if (static_cast<int32_t>(closing_tokens.size()) >= steps - charged) break;
+            llama_batch_ext_clear(batch.get());
+            for (size_t i = 0; i < closing_tokens.size(); ++i) {
+                if (!add_token(closing_tokens[i], i + 1 == closing_tokens.size())) {
+                    report(error, error_size, "The engine could not finish reasoning.");
+                    return NL_ERROR;
+                }
+            }
+            if (llama_process(context, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                if (stopped(cancel)) break;
+                report(error, error_size, "The engine could not finish reasoning.");
+                return NL_ERROR;
+            }
+            deliberating = false;
+            charged += static_cast<int32_t>(closing_tokens.size());
+            pending += closing;
+            emit_text(pending, chunk, user);
+            continue;
+        }
+        if (eog) {
+            *finish = NL_FINISH_EOG;
+            break;
+        }
+        std::string piece;
         char small[256];
         int32_t size = llama_token_to_piece(vocab, token, small, sizeof(small), 0, true);
         if (size >= 0) {
-            pending.append(small, size);
+            piece.assign(small, size);
         } else {
             std::string large(-size, '\0');
             size = llama_token_to_piece(vocab, token, large.data(), static_cast<int32_t>(large.size()), 0, true);
-            if (size > 0) pending.append(large.data(), size);
+            if (size > 0) piece.assign(large.data(), size);
         }
+        if (deliberating) {
+            thought_tail += piece;
+            if (thought_tail.find("</think>") != std::string::npos) deliberating = false;
+            if (thought_tail.size() > 16) thought_tail.erase(0, thought_tail.size() - 16);
+        }
+        pending += piece;
         ++*generated;
+        ++charged;
         emit_text(pending, chunk, user);
-        if (i + 1 == steps) break;
+        if (charged >= steps) break;
 
         llama_batch_ext_clear(batch.get());
         if ((!add_token(token, true) || llama_process(context, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0)
@@ -409,5 +489,6 @@ int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
         }
     }
     emit_text(pending, chunk, user, true);
+    if (stopped(cancel)) *finish = NL_FINISH_STOPPED;
     return stopped(cancel) ? NL_STOPPED : NL_OK;
 }
