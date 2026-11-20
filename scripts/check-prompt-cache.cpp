@@ -76,12 +76,13 @@ int main(int argc, char **argv) {
         long_history += "Record " + std::to_string(line) + ": temperatures were taken before dawn.\n";
     }
     const std::vector<NLMessage> original{{"user", long_history.c_str(), nullptr},
-        {"assistant", "I have the field notes.", nullptr}, {"user", "What number is nine times eight?", nullptr}};
+        {"assistant", "I have the field notes.", nullptr},
+        {"user", "What is nine times eight? After answering, list the numbers 1 through 30 in order as digits.", nullptr}};
     const auto plan = generate(runtime.get(), stop.get(), "Quattro planning", original,
         "Choose the calculation tool. Output only the word calculate.", NL_PROMPT_REBUILT, nullptr, true,
         nullptr, "root ::= \"calculate\"");
     assert(plan.reply == "calculate");
-    const char *tool = "A calculator returned 72. State the result briefly.";
+    const char *tool = "A calculator returned 72. Start with the result, then write all thirty numbers separated by commas.";
     const auto warm = generate(runtime.get(), stop.get(), "Tool result, warm", original, tool, NL_PROMPT_MEMORY);
     assert(warm.stats.reused_tokens > 1024);
     constexpr size_t disk_limit = 200 * 1024 * 1024;
@@ -98,7 +99,7 @@ int main(int argc, char **argv) {
     const auto cold = generate(runtime.get(), stop.get(), "Tool result, rebuild", original, tool,
         NL_PROMPT_REBUILT, path.c_str(), false);
     assert(warm.reply == cold.reply && restored.reply == cold.reply);
-    const char *continued = "Continue the answer from its exact stopping point, with no repetition.";
+    const char *continued = "Finish listing the numbers through 30. Continue at the exact stopping point without repeating any numbers.";
     generate(runtime.get(), stop.get(), "Continuation, disk", original, continued, NL_PROMPT_STORAGE,
         path.c_str(), true, warm.reply.c_str());
     auto next = original;
