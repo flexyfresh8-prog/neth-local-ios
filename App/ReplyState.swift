@@ -80,6 +80,7 @@ struct ProjectWork: Codable, Equatable, Sendable {
     let folder: String
     let name: String
     let files: [PlannedFile]
+    var bundle: String? = nil
     var cursor = 0
     var draft = ""
 }
@@ -88,6 +89,7 @@ struct ReplyMetadata: Codable, Equatable, Sendable {
     var effort: EffortPreset
     var quattro: Bool
     var web = false
+    var wantsFiles: Bool? = nil
     var finish: ReplyFinish = .working
     var trace: [ToolTrace] = []
     var files: [WorkspaceFile] = []
@@ -107,6 +109,18 @@ struct RunSettings: Sendable {
     let quattro: Bool
     let web: Bool
     let makeFiles: Bool
+}
+
+struct ModelRequest: Sendable {
+    let history: [ChatMessage]
+    var evidence: WebEvidence? = nil
+    var recall: [TranscriptMatch] = []
+    var digest: ContextDigest? = nil
+    var instructions = ""
+    var prefix = ""
+    var grammar: String? = nil
+    var reasoning = 0
+    let limit: Int
 }
 
 enum ReplyContinuation {

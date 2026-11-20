@@ -34,6 +34,7 @@ typedef struct {
 size_t nl_available_memory(void);
 NLCancel *nl_cancel_create(void);
 void nl_cancel_request(NLCancel *cancel);
+bool nl_cancel_requested(const NLCancel *cancel);
 void nl_cancel_free(NLCancel *cancel);
 
 NLRuntime *nl_open(const char *model_path, int32_t context, bool metal, int32_t cache,

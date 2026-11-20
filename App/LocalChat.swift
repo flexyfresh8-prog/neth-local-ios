@@ -121,7 +121,7 @@ final class LocalChat: ObservableObject {
             let task = try await self.archive.append(ChatMessage(role: .user, text: text, photo: photo), to: id)
             let reply = try await self.archive.append(ChatMessage(role: .assistant, text: "",
                 metadata: ReplyMetadata(effort: runSettings.effort, quattro: runSettings.quattro || runSettings.makeFiles,
-                                        web: runSettings.web)), to: id)
+                                        web: runSettings.web, wantsFiles: runSettings.makeFiles)), to: id)
             if self.conversationID != id || self.hasLater || self.messages.count >= 100 {
                 let page = try await self.archive.page(in: id, limit: self.pageSize + 1)
                 self.messages = Array(page.suffix(self.pageSize))
@@ -141,20 +141,19 @@ final class LocalChat: ObservableObject {
         guard !running, !opening, let id = conversationID, message.role == .assistant else { return }
         let previous = message.metadata
         let runSettings = RunSettings(effort: effort, quattro: previous?.quattro ?? false,
-                                      web: previous?.web ?? false, makeFiles: previous?.project != nil)
+                                      web: previous?.web ?? false, makeFiles: previous?.wantsFiles == true || previous?.project != nil)
         begin(effort) { stop in
             try await self.produce(message, in: id, settings: settings, runSettings: runSettings, stop: stop, resuming: true)
         }
     }
 
-    func saveReply(_ message: ChatMessage, as name: String) async {
+    func saveReply(_ message: ChatMessage, text: String, as name: String) async {
         guard !running, !opening, let id = conversationID else { return }
-        let text = ReplyFormat(message.text).answer
         guard !text.isEmpty else { return }
         opening = true
         defer { opening = false }
         do {
-            let file = try await workspace.save(text + "\n", name: name, conversation: id)
+            let file = try await workspace.save(text.hasSuffix("\n") ? text : text + "\n", name: name, conversation: id)
             var updated = message
             if updated.metadata == nil {
                 updated.metadata = ReplyMetadata(effort: .balanced, quattro: false, finish: .complete)
@@ -205,7 +204,7 @@ final class LocalChat: ObservableObject {
             let history = Self.activeTurns(historyPage, context: settings?.context ?? 4096, searchWeb: runSettings.web)
             let cutoff = history.first?.id ?? task.id
             async let notes = archive.recall(task.text, in: id, before: cutoff)
-            async let compacted = archive.compact(in: id, before: cutoff)
+            async let compacted = compactedHistory(in: id, before: cutoff, enabled: settings?.compactHistory == true)
             let toolMode = reply.metadata?.quattro == true
             let isProject = reply.metadata?.project != nil
             let hasReply = !ReplyContinuation.visible(reply.text).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -224,7 +223,7 @@ final class LocalChat: ObservableObject {
                     try await checkpoint(reply, in: id)
                     return
                 }
-            } else if runSettings.web && reply.evidence == nil && !resuming {
+            } else if runSettings.web && reply.evidence == nil && (!resuming || !hasReply) {
                 setActivity("Searching the web", step: 1, total: 1)
                 do { reply.evidence = try await searcher.find(task.text) }
                 catch is CancellationError { throw CancellationError() }
@@ -242,7 +241,7 @@ final class LocalChat: ObservableObject {
                 throw LocalError(message: "Download or import a model to generate a response.")
             }
             let recall = (try? await notes) ?? []
-            let digest = settings.compactHistory ? (try? await compacted) : nil
+            let digest = await compacted
             try await writeReply(&reply, history: history, recall: recall, digest: digest, id: id,
                                  settings: settings, effort: runSettings.effort, stop: stop, resuming: resuming)
         } catch is CancellationError {
@@ -252,6 +251,11 @@ final class LocalChat: ObservableObject {
             reply.metadata?.finish = .error
         }
         try await checkpoint(reply, in: id)
+    }
+
+    private func compactedHistory(in id: String, before cutoff: Int64, enabled: Bool) async -> ContextDigest? {
+        guard enabled else { return nil }
+        return try? await archive.compact(in: id, before: cutoff)
     }
 
     private func writeReply(_ reply: inout ChatMessage, history: [ChatMessage], recall: [TranscriptMatch],

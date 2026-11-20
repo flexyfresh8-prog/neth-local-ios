@@ -116,7 +116,7 @@ enum QuattroPlan {
         }
         let slug = String(ToolCatalog.words(name).joined(separator: "-").prefix(44))
         return ProjectWork(folder: UUID().uuidString, name: slug.isEmpty ? "project" : slug,
-                           files: Array(files.prefix(maximum)))
+                           files: Array(files.prefix(maximum)), bundle: request.bundleName)
     }
 
     static func filePrompt(_ file: PlannedFile, project: ProjectWork, request: String, linked: [String]) -> String {
@@ -135,13 +135,10 @@ enum QuattroPlan {
 
     static func fileContent(_ text: String, path: String) -> String {
         let ext = (path as NSString).pathExtension.lowercased()
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = text.trimmingCharacters(in: .newlines)
         if ext != "md" {
             let blocks = ReplyFormat(trimmed).blocks
-            if let code = blocks.compactMap({ block -> String? in
-                if case .code(_, let value) = block { return value }
-                return nil
-            }).first {
+            if blocks.count == 1, case .code(_, let code) = blocks[0] {
                 return code + "\n"
             }
         }

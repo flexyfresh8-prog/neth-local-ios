@@ -17,6 +17,11 @@ struct NethLocalApp: App {
 
 @MainActor
 private struct ChatScreen: View {
+    private struct FileExport {
+        let message: ChatMessage
+        let text: String
+    }
+
     private enum Sheet: String, Identifiable {
         case history, search, models, tools
         var id: Self { self }
@@ -43,7 +48,7 @@ private struct ChatScreen: View {
     @State private var photo: URL?
     @State private var loadingPhoto = false
     @State private var nearBottom = true
-    @State private var exporting: ChatMessage?
+    @State private var exporting: FileExport?
     @State private var exportName = "Reply.md"
 
     private var canAttach: Bool { models.current?.isPreset == true && models.projector != nil }
@@ -119,11 +124,14 @@ private struct ChatScreen: View {
                     .autocorrectionDisabled()
                 Button("Save") {
                     let name = exportName
-                    Task { await chat.saveReply(reply, as: name) }
+                    Task { await chat.saveReply(reply.message, text: reply.text, as: name) }
                 }
                 Button("Cancel", role: .cancel) {}
             } message: { _ in Text("Enter a filename such as Notes.md, Notes.txt or Notes.pdf.") }
         .onChange(of: models.projector) { _, _ in if !canAttach { clearAttachment() } }
+        .onChange(of: context) { _, _ in chat.unload() }
+        .onChange(of: cache) { _, _ in chat.unload() }
+        .onChange(of: cpuOnly) { _, _ in chat.unload() }
         .onChange(of: scene) { _, phase in if phase == .background { chat.unload() } }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
             chat.unload()
@@ -375,7 +383,8 @@ private struct ChatScreen: View {
                         let active = message.id == chat.activeReplyID && chat.running
                         ChatMessageRow(message: message, streaming: active, activity: active ? chat.activity : nil,
                                        allowActions: !busy,
-                                       resume: { continueReply(message) }, save: { saveReply(message) })
+                                       resume: { continueReply(message) },
+                                       save: { text, name in saveReply(message, text: text, name: name) })
                             .equatable()
                             .id(message.id)
                     }
@@ -627,9 +636,9 @@ private struct ChatScreen: View {
         chat.resume(reply, effort: effort, settings: engineSettings)
     }
 
-    private func saveReply(_ reply: ChatMessage) {
-        exportName = "Reply.md"
-        exporting = reply
+    private func saveReply(_ reply: ChatMessage, text: String, name: String) {
+        exportName = name
+        exporting = FileExport(message: reply, text: text)
     }
 
     private func newChat() {

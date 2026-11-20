@@ -27,7 +27,8 @@ final class QuattroAgent {
             return .handled
         }
         if let project = reply.metadata?.project {
-            try await build(project: project, request: text, reply: &reply, effort: settings.effort,
+            let brief = try QuattroPlan.projectRequest(text, explicit: true)?.prompt ?? text
+            try await build(project: project, request: brief, reply: &reply, effort: settings.effort,
                             conversation: conversation, report: report, stream: stream, checkpoint: checkpoint)
             return .handled
         }
@@ -48,7 +49,11 @@ final class QuattroAgent {
                 planned = try await structured(prompt: QuattroPlan.manifestPrompt(request, files: settings.effort.projectFiles),
                                                grammar: QuattroPlan.projectGrammar, limit: 480, stream: stream)
             } else { planned = nil }
-            let project = QuattroPlan.project(request, output: planned, maximum: settings.effort.projectFiles)
+            let maximum = max(settings.effort.projectFiles, min(12, request.namedPaths.count))
+            let project = QuattroPlan.project(request, output: planned, maximum: maximum)
+            if request.namedPaths.count > maximum {
+                reply.notice = "This run can create the first \(maximum) requested files."
+            }
             reply.metadata?.project = project
             try await checkpoint(reply, true)
             try await build(project: project, request: request.prompt, reply: &reply, effort: settings.effort,
@@ -122,9 +127,10 @@ final class QuattroAgent {
             let file = project.files[project.cursor]
             report("Writing \(file.path)", project.cursor + 1, project.files.count)
             var linked: [String] = []
-            for existing in (reply.metadata?.files ?? []).suffix(3) where !existing.name.hasSuffix(".zip") {
+            let peers = (reply.metadata?.files ?? []).filter { !$0.name.hasSuffix(".zip") && $0.name != file.path }.suffix(3)
+            for existing in peers {
                 if let preview = try? await tools.workspace.read(existing.id, conversation: conversation, limit: 340) {
-                    linked.append("\(existing.name): \(preview)")
+                    linked.append("\(existing.name): \(preview.replacingOccurrences(of: "<|", with: "‹|"))")
                 }
             }
             let prompt = QuattroPlan.filePrompt(file, project: project, request: request, linked: linked)
@@ -135,20 +141,33 @@ final class QuattroAgent {
                 if Task.isCancelled { reason = .stopped; break }
                 let previous = project.draft
                 var segment = ""
+                var savedAt = Date()
                 let writing = ModelRequest(history: [ChatMessage(role: .user, text: prompt)], evidence: reply.evidence,
                                            instructions: previous.isEmpty ? "" : "Continue this file from the exact last character. Output only the remaining file contents.",
                                            prefix: previous, limit: limit)
                 do {
-                    reason = try await stream(writing) { segment += $0 }
+                    reason = try await stream(writing) {
+                        segment += $0
+                        let now = Date()
+                        if now.timeIntervalSince(savedAt) >= 3 {
+                            var saved = project
+                            saved.draft = previous + segment
+                            var snapshot = reply
+                            snapshot.metadata?.project = saved
+                            try await checkpoint(snapshot, true)
+                            savedAt = now
+                        }
+                    }
                 } catch is CancellationError {
                     reason = .stopped
                 } catch {
                     reason = .error
                     issue = error.localizedDescription
                 }
-                project.draft += ReplyContinuation.removeOverlap(previous: previous, added: segment)
+                let addition = ReplyContinuation.removeOverlap(previous: previous, added: segment)
+                project.draft += addition
                 if Task.isCancelled { reason = .stopped }
-                if segment.isEmpty || reason == .stopped || reason == .error { break }
+                if addition.isEmpty || reason == .stopped || reason == .error { break }
                 if reason == .complete {
                     if QuattroPlan.looksComplete(project.draft, path: file.path) { break }
                     reason = .outputLimit
@@ -180,11 +199,11 @@ final class QuattroAgent {
                 return
             }
         }
-        if project.files.count > 1 || request.lowercased().contains(".zip") {
+        if project.files.count > 1 || project.bundle != nil {
             report("Packaging files", project.files.count, project.files.count)
             let files = reply.metadata?.files ?? []
             let archive = try await tools.workspace.archive(files.filter { !$0.name.lowercased().hasSuffix(".zip") },
-                                                            name: "\(project.name).zip", conversation: conversation,
+                                                            name: project.bundle ?? "\(project.name).zip", conversation: conversation,
                                                             folder: project.folder)
             reply.metadata?.attach(archive)
             reply.metadata?.trace.append(ToolTrace(tool: "file.zip", title: "Packaged \(archive.name)",

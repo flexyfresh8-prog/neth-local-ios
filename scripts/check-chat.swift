@@ -117,6 +117,7 @@ struct ChatChecks {
         precondition(project.files.map(\.path) == ["index.html", "css/style.css"])
         precondition(QuattroPlan.looksComplete("{\"a\": 1}", path: "data.json"))
         precondition(!QuattroPlan.looksComplete("{\"a\": ", path: "data.json"))
+        try await checkQuattro(tools)
         try await checkLegacy(root)
         if CommandLine.arguments.count == 2 {
             let directory = URL(fileURLWithPath: CommandLine.arguments[1])
@@ -125,6 +126,58 @@ struct ChatChecks {
             try QuattroPlan.projectGrammar.write(to: directory.appending(path: "project.gbnf"), atomically: true, encoding: .utf8)
         }
         print("Checked reply continuation, migration, compression, web parsers, files and \(catalog.tools.count) callable tools.")
+    }
+
+    @MainActor
+    private static func checkQuattro(_ tools: QuattroTools) async throws {
+        let agent = QuattroAgent(tools: tools)
+        let task = ChatMessage(id: 41, role: .user, text: "Create a website with index.html and style.css named Site.zip")
+        let mode = RunSettings(effort: .balanced, quattro: true, web: false, makeFiles: true)
+        var reply = ChatMessage(id: 42, role: .assistant, text: "", metadata: ReplyMetadata(effort: .balanced, quattro: true))
+        let first = try await agent.run(reply: &reply, task: task, conversation: "site", historyFiles: [], settings: mode,
+            report: { _, _, _ in }, stream: { request, receive in
+                precondition(request.history.last?.text.contains("index.html") == true)
+                try await receive("<!doctype html>\n<html><body>Saved")
+                return .stopped
+            }, checkpoint: { _, _ in })
+        guard case .handled = first else { preconditionFailure("Quattro did not run file creation.") }
+        precondition(reply.metadata?.finish == .stopped && reply.metadata?.files.first?.partial == true)
+        let partialID = reply.metadata?.files.first?.id
+        var passes = 0
+        let resumed = try await agent.run(reply: &reply, task: task, conversation: "site", historyFiles: [], settings: mode,
+            report: { _, _, _ in }, stream: { request, receive in
+                passes += 1
+                if passes == 1 {
+                    precondition(request.prefix.hasSuffix("Saved"))
+                    try await receive(" draft.</body></html>")
+                } else {
+                    precondition(request.prefix.isEmpty)
+                    try await receive("body { color: #123; }")
+                }
+                return .complete
+            }, checkpoint: { _, _ in })
+        guard case .handled = resumed else { preconditionFailure("Quattro did not resume the saved project.") }
+        precondition(reply.metadata?.finish == .complete && passes == 2)
+        let files = reply.metadata!.files
+        precondition(files.map(\.name) == ["index.html", "style.css", "Site.zip"] && files.first?.id == partialID)
+        precondition(files.allSatisfy { !$0.partial })
+        let html = try await tools.workspace.read(files[0].id, conversation: "site")
+        precondition(html.contains("Saved draft.</body></html>"))
+
+        let calculation = ChatMessage(role: .user, text: "Calculate the area of a circle with radius 3.")
+        let automatic = RunSettings(effort: .balanced, quattro: true, web: false, makeFiles: false)
+        var result = ChatMessage(id: 44, role: .assistant, text: "", metadata: ReplyMetadata(effort: .balanced, quattro: true))
+        var calls = 0
+        let passed = try await agent.run(reply: &result, task: calculation, conversation: "circle", historyFiles: [],
+            settings: automatic, report: { _, _, _ in }, stream: { request, receive in
+                precondition(request.grammar != nil)
+                calls += 1
+                try await receive(calls == 1 ? #"{"tool":"math.circle","arguments":{"radius":3}}"#
+                                            : #"{"tool":"answer","arguments":{}}"#)
+                return .complete
+            }, checkpoint: { _, _ in })
+        guard case .answer = passed else { preconditionFailure("Quattro did not pass its tool result back to chat.") }
+        precondition(calls == 2 && result.metadata?.trace.first?.detail.contains("28.274333882") == true)
     }
 
     private static func checkLegacy(_ root: URL) async throws {

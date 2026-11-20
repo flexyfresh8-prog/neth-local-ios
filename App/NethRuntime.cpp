@@ -54,10 +54,11 @@ size_t nl_available_memory() {
 
 NLCancel *nl_cancel_create() { return new NLCancel; }
 void nl_cancel_request(NLCancel *cancel) { cancel->requested.store(true); }
+bool nl_cancel_requested(const NLCancel *cancel) { return cancel->requested.load(); }
 void nl_cancel_free(NLCancel *cancel) { delete cancel; }
 
 static bool stopped(void *cancel) {
-    return static_cast<NLCancel *>(cancel)->requested.load();
+    return nl_cancel_requested(static_cast<NLCancel *>(cancel));
 }
 
 static bool loading(float, void *cancel) {
@@ -134,6 +135,7 @@ NLRuntime *nl_open(const char *model_path, int32_t context, bool metal, int32_t 
                 auto small_cache = params;
                 small_cache.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
                 small_cache.type_k = small_cache.type_v = mode == 1 ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0;
+                if (stopped(cancel)) return nullptr;
                 runtime->context = llama_init_from_model(runtime->model, small_cache);
                 if (runtime->context) {
                     runtime->cache = mode;
@@ -142,11 +144,12 @@ NLRuntime *nl_open(const char *model_path, int32_t context, bool metal, int32_t 
             }
             if (runtime->context) break;
         }
-        if (window <= 1024 || fits(size_t(window) * full_cache_per_token)) {
+        if (stopped(cancel)) return nullptr;
+        if (window <= 512 || fits(size_t(window) * full_cache_per_token)) {
             runtime->context = llama_init_from_model(runtime->model, params);
             if (runtime->context) break;
         }
-        if (window <= 1024) break;
+        if (window <= 512) break;
     }
     if (stopped(cancel)) return nullptr;
     if (!runtime->context) {
@@ -230,7 +233,7 @@ static std::vector<llama_token> tokenize(const llama_vocab *vocab, const std::st
     return tokens;
 }
 
-static void emit_text(std::string &pending, NLChunk chunk, void *user, bool final = false) {
+static void emit_text(std::string &pending, NLChunk chunk, void *user) {
     size_t offset = 0;
     while (offset < pending.size()) {
         const auto lead = static_cast<unsigned char>(pending[offset]);
@@ -238,8 +241,8 @@ static void emit_text(std::string &pending, NLChunk chunk, void *user, bool fina
         if (lead >= 0xc2 && lead <= 0xdf) width = 2;
         if (lead >= 0xe0 && lead <= 0xef) width = 3;
         if (lead >= 0xf0 && lead <= 0xf4) width = 4;
-        if (offset + width > pending.size() && !final) break;
-        offset = std::min(offset + width, pending.size());
+        if (offset + width > pending.size()) break;
+        offset += width;
     }
     if (offset > 0) {
         chunk(reinterpret_cast<const uint8_t *>(pending.data()), offset, user);
@@ -352,7 +355,9 @@ int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
             tokens = tokenize(vocab, prompt);
             used = static_cast<int32_t>(tokens.size());
         }
-        if (used <= 0 || used > capacity - 8) {
+        const bool needs_output_room = first + 1 == count && !prefix.empty()
+                                       && used + std::min(output_limit, 128) > capacity;
+        if (used <= 0 || used > capacity - 8 || needs_output_room) {
             if (first + 1 == count) {
                 if (!prefix.empty()) {
                     size_t start = (prefix.size() + 1) / 2;
@@ -488,7 +493,8 @@ int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
             return NL_ERROR;
         }
     }
-    emit_text(pending, chunk, user, true);
+    // Continue can regenerate an unfinished UTF-8 scalar from the last valid text.
+    emit_text(pending, chunk, user);
     if (stopped(cancel)) *finish = NL_FINISH_STOPPED;
     return stopped(cancel) ? NL_STOPPED : NL_OK;
 }

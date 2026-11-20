@@ -18,7 +18,7 @@ struct ChatMessageRow: View, Equatable {
     let activity: String?
     let allowActions: Bool
     let resume: () -> Void
-    let save: () -> Void
+    let save: (String, String) -> Void
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.message == rhs.message && lhs.streaming == rhs.streaming && lhs.activity == rhs.activity
@@ -96,7 +96,9 @@ struct ChatMessageRow: View, Equatable {
                             .textSelection(.enabled)
                             .lineSpacing(4)
                     case .code(let language, let code):
-                        CodePanel(language: language, code: code)
+                        CodePanel(language: language, code: code, allowSave: allowActions && !streaming) {
+                            save(code, "Snippet.\(Self.extensionForLanguage(language))")
+                        }
                     }
                 }
                 if let evidence = message.evidence { sources(evidence) }
@@ -123,7 +125,7 @@ struct ChatMessageRow: View, Equatable {
                 if !content.answer.isEmpty && !streaming {
                     HStack(spacing: 8) {
                         CopyControl(content: content.answer, accessibilityTitle: "Copy reply", compact: true)
-                        Button(action: save) {
+                        Button { save(content.answer, "Reply.md") } label: {
                             Label("Save as file", systemImage: "doc.badge.plus")
                                 .font(.caption.weight(.semibold))
                         }
@@ -143,6 +145,15 @@ struct ChatMessageRow: View, Equatable {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.top, 3)
         }
+    }
+
+    private static func extensionForLanguage(_ language: String) -> String {
+        let label = language.lowercased()
+        let aliases = ["javascript": "js", "typescript": "ts", "python": "py", "bash": "sh",
+                       "shell": "sh", "rust": "rs", "c++": "cpp", "markdown": "md", "kotlin": "kt",
+                       "csharp": "cs", "golang": "go", "powershell": "ps1"]
+        let ext = aliases[label] ?? label
+        return ChatWorkspace.supportedExtensions.contains(ext) ? ext : "txt"
     }
 
     private var resumeButton: some View {
@@ -188,6 +199,8 @@ struct ChatMessageRow: View, Equatable {
 private struct CodePanel: View {
     let language: String
     let code: String
+    let allowSave: Bool
+    let save: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -197,6 +210,13 @@ private struct CodePanel: View {
                     .accessibilityHidden(true)
                 Text(verbatim: language).font(.system(.caption, design: .monospaced))
                 Spacer()
+                if allowSave && !code.isEmpty {
+                    Button(action: save) {
+                        Image(systemName: "doc.badge.plus").frame(width: 36, height: 38)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Save code as file")
+                }
                 CopyControl(content: code, accessibilityTitle: "Copy \(language) code", compact: false)
             }
             .font(.caption)

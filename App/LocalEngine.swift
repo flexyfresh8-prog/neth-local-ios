@@ -29,20 +29,9 @@ enum EngineEvent: Sendable {
     case finished(ReplyFinish, count: Int, seconds: Double)
 }
 
-struct ModelRequest: Sendable {
-    let history: [ChatMessage]
-    var evidence: WebEvidence? = nil
-    var recall: [TranscriptMatch] = []
-    var digest: ContextDigest? = nil
-    var instructions = ""
-    var prefix = ""
-    var grammar: String? = nil
-    var reasoning = 0
-    let limit: Int
-}
-
 final class GenerationStop: @unchecked Sendable {
     let handle = nl_cancel_create()!
+    var cancelled: Bool { nl_cancel_requested(handle) }
     func request() { nl_cancel_request(handle) }
     deinit { nl_cancel_free(handle) }
 }
@@ -147,10 +136,13 @@ final class LocalEngine: @unchecked Sendable {
                 }
             }
             guard let runtime else {
-                if metal { continue }
+                if metal && !stop.cancelled { continue }
+                if stop.cancelled {
+                    continuation.yield(.finished(.stopped, count: 0, seconds: 0))
+                    return
+                }
                 let message = String(cString: error)
-                if !message.isEmpty { throw LocalError(message: message) }
-                return
+                throw LocalError(message: message.isEmpty ? "Couldn't load the model." : message)
             }
 
             let context = Int(nl_context_window(runtime))

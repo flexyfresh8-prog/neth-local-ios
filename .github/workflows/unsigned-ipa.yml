@@ -21,7 +21,7 @@ jobs:
           xcrun --sdk macosx swiftc -swift-version 5 -parse-as-library \
             App/ChatArchive.swift App/WebSearch.swift App/ReplyFormat.swift App/ReplyState.swift \
             App/ContextMemory.swift App/QuattroCatalog.swift App/QuattroTools.swift App/QuattroPlan.swift \
-            App/ChatWorkspace.swift scripts/check-chat.swift \
+            App/ChatWorkspace.swift App/QuattroAgent.swift scripts/check-chat.swift \
             -lsqlite3 -o "$RUNNER_TEMP/check-chat"
           "$RUNNER_TEMP/check-chat"
       - name: Build and verify iPad packages
