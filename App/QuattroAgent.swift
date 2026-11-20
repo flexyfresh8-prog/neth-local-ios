@@ -44,7 +44,7 @@ final class QuattroAgent {
                 try await execute(call, context: context, reply: &reply, report: report, step: 1, total: 1)
                 reply.metadata?.finish = .complete
                 return .handled
-            } else if request.namedPaths.isEmpty {
+            } else if request.needsManifest {
                 report("Planning files", 0, max(1, settings.effort.projectFiles))
                 planned = try await structured(prompt: QuattroPlan.manifestPrompt(request, files: settings.effort.projectFiles),
                                                grammar: QuattroPlan.projectGrammar, limit: 480, stream: stream)

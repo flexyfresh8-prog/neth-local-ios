@@ -16,7 +16,7 @@ final class LocalChat: ObservableObject {
     @Published private(set) var profile: RuntimeProfile?
     @Published private(set) var promptMetrics: PromptMetrics?
     @Published private(set) var checkpointNotice: String?
-    @Published private(set) var tokensPerSecond: Double?
+    @Published private(set) var generation = GenerationMetrics()
     @Published private(set) var hasEarlier = false
     @Published private(set) var hasLater = false
     @Published private(set) var targetMessage: Int64?
@@ -54,7 +54,7 @@ final class LocalChat: ObservableObject {
         hasLater = false
         targetMessage = nil
         activity = nil
-        tokensPerSecond = nil
+        generation = GenerationMetrics()
         promptMetrics = nil
         checkpointNotice = nil
     }
@@ -74,7 +74,7 @@ final class LocalChat: ObservableObject {
                 hasLater = false
                 targetMessage = nil
                 activity = nil
-                tokensPerSecond = nil
+                generation = GenerationMetrics()
                 promptMetrics = nil
                 checkpointNotice = nil
                 profile = nil
@@ -103,7 +103,7 @@ final class LocalChat: ObservableObject {
             hasLater = later
             targetMessage = message
             activity = nil
-            tokensPerSecond = nil
+            generation = GenerationMetrics()
         } catch { problem = error.localizedDescription }
     }
 
@@ -183,7 +183,7 @@ final class LocalChat: ObservableObject {
         activeStop = stop
         activeEffort = effort
         running = true
-        tokensPerSecond = nil
+        generation = GenerationMetrics()
         promptMetrics = nil
         checkpointNotice = nil
         setActivity("Preparing", step: 0, total: 0)
@@ -351,6 +351,7 @@ final class LocalChat: ObservableObject {
                             keepActivity: Bool, receive: (String) async throws -> Void) async throws -> ReplyFinish {
         var finish: ReplyFinish = .stopped
         var received = false
+        let previousPasses = generation
         for try await event in engine.stream(request, in: id, settings: settings, stop: stop) {
             switch event {
             case .loading(let backend):
@@ -365,8 +366,9 @@ final class LocalChat: ObservableObject {
                 try await receive(part)
             case .prompt(let metrics):
                 promptMetrics = metrics
-            case .finished(let reason, let count, let seconds):
-                if count > 1 { tokensPerSecond = Double(count - 1) / seconds }
+            case .progress(let count, let seconds):
+                generation = previousPasses.addingPass(tokens: count, seconds: seconds)
+            case .finished(let reason):
                 finish = reason
             }
         }

@@ -12,7 +12,7 @@ struct WorkspaceBackdrop: View {
             }
             let center = CGPoint(x: size.width * 0.5, y: size.height * 0.43)
             context.fill(dots, with: .radialGradient(
-                Gradient(colors: [NethPalette.text.opacity(0.18), NethPalette.muted.opacity(0.07), .clear]),
+                Gradient(colors: [NethPalette.violet.opacity(0.21), NethPalette.muted.opacity(0.07), .clear]),
                 center: center, startRadius: 0, endRadius: max(size.width, size.height) * 0.72
             ))
         }
@@ -58,12 +58,12 @@ struct WorkspaceScene: View {
                     var star = Path()
                     star.addRect(tile(x - 1, y, width: 3))
                     star.addRect(tile(x, y - 1, height: 3))
-                    context.fill(star, with: .color(NethPalette.text.opacity(0.69)))
+                    context.fill(star, with: .color(NethPalette.violet.opacity(0.72)))
                 }
 
                 let colors: [(Character, Color)] = [
                     ("#", NethPalette.text.opacity(0.88)), ("+", NethPalette.muted),
-                    (":", NethPalette.border), (".", NethPalette.muted.opacity(0.77))
+                    (":", NethPalette.border), (".", NethPalette.violet.opacity(0.64))
                 ]
                 for (character, color) in colors {
                     var pixels = Path()
@@ -86,11 +86,10 @@ struct WorkspaceScene: View {
             }
 
             NethMascot()
-                .dynamicTypeSize(.large)
                 .padding(.horizontal, 17)
                 .padding(.vertical, 11)
                 .background(NethPalette.inset, in: .rect(cornerRadius: 10))
-                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(NethPalette.border))
+                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(NethPalette.violet.opacity(0.24)))
                 .padding(.leading, 16)
                 .padding(.bottom, 13)
         }

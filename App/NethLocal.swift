@@ -190,7 +190,7 @@ private struct ChatScreen: View {
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.system(size: 17, weight: .medium))
-                .foregroundStyle(selected ? NethPalette.text : NethPalette.muted)
+                .foregroundStyle(selected ? NethPalette.violet : NethPalette.muted)
                 .frame(width: 44, height: 44)
                 .background(selected ? NethPalette.selected : .clear, in: .rect(cornerRadius: 8))
                 .contentShape(Rectangle())
@@ -286,7 +286,7 @@ private struct ChatScreen: View {
                     .lineLimit(typeSize.isAccessibilitySize ? 2 : 1)
                 Spacer(minLength: 4)
                 if selected {
-                    Circle().fill(NethPalette.muted).frame(width: 4, height: 4)
+                    Circle().fill(NethPalette.violet).frame(width: 4, height: 4)
                         .accessibilityHidden(true)
                 }
             }
@@ -319,7 +319,7 @@ private struct ChatScreen: View {
                 .padding(.horizontal, 14)
                 .frame(minHeight: 48)
                 .background(NethPalette.canvas)
-                .overlay(alignment: .top) { Rectangle().fill(NethPalette.muted).frame(height: 1) }
+                .overlay(alignment: .top) { Rectangle().fill(NethPalette.violet.opacity(0.8)).frame(height: 1) }
                 .overlay(alignment: .trailing) { Rectangle().fill(NethPalette.border).frame(width: 1) }
                 Spacer(minLength: 4)
                 if let runtimeDetail {
@@ -357,9 +357,7 @@ private struct ChatScreen: View {
     }
 
     private var runtimeDetail: String? {
-        guard let profile = chat.profile else { return nil }
-        guard let rate = chat.tokensPerSecond, !chat.running else { return profile.detail }
-        return "\(profile.detail) · \(rate.formatted(.number.precision(.fractionLength(1)))) tok/s"
+        chat.profile?.detail
     }
 
     private func runtimeLabel(_ detail: String) -> some View {
@@ -510,6 +508,7 @@ private struct ChatScreen: View {
             } action: { _, close in nearBottom = close }
             .scrollDismissesKeyboard(.interactively)
             .defaultScrollAnchor(.bottom)
+            .defaultScrollAnchor(.top, for: .alignment)
             .onChange(of: chat.messages.last?.text) { _, _ in
                 if nearBottom && !chat.hasLater && chat.targetMessage == nil { reader.scrollTo("latest", anchor: .bottom) }
             }
@@ -549,8 +548,9 @@ private struct ChatScreen: View {
 
     private func composer(maxLines: Int) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            if chat.running {
-                EffortMeter(activity: chat.activity ?? "Preparing…", step: chat.effortStep, total: chat.effortTotal)
+            if chat.running || chat.generation.tokens > 0 {
+                EffortMeter(activity: chat.running ? (chat.activity ?? "Preparing…") : "Generated",
+                            step: chat.effortStep, total: chat.effortTotal, running: chat.running, metrics: chat.generation)
                     .padding(.horizontal, 3)
                     .transition(.offset(y: 4).combined(with: .opacity))
             }
@@ -611,7 +611,7 @@ private struct ChatScreen: View {
             .padding(9)
             .background(NethPalette.surface, in: .rect(cornerRadius: 11))
             .overlay(RoundedRectangle(cornerRadius: 11)
-                .strokeBorder(typing ? NethPalette.muted.opacity(0.75) : NethPalette.border)
+                .strokeBorder(typing ? NethPalette.violet.opacity(0.58) : NethPalette.border)
                 .allowsHitTesting(false))
             .animation(reduceMotion ? nil : NethMotion.fade, value: typing)
             .animation(reduceMotion ? nil : NethMotion.fade, value: photo != nil)
@@ -645,10 +645,10 @@ private struct ChatScreen: View {
                 Text(label)
             }
             .font(.caption.weight(active ? .semibold : .medium))
-            .foregroundStyle(active ? NethPalette.text : NethPalette.muted)
+            .foregroundStyle(active ? NethPalette.violet : NethPalette.muted)
             .padding(.horizontal, 8)
             .padding(.vertical, 7)
-            .background(active ? NethPalette.selected : .clear, in: .rect(cornerRadius: 7))
+            .background(active ? NethPalette.violet.opacity(0.13) : .clear, in: .rect(cornerRadius: 7))
             .frame(minHeight: 44)
             .contentShape(Rectangle())
             .fixedSize(horizontal: true, vertical: false)
@@ -773,7 +773,7 @@ private struct ChatScreen: View {
                 .contentTransition(reduceMotion ? .identity : .symbolEffect(.replace))
                 .foregroundStyle(enabled ? NethPalette.canvas : NethPalette.muted)
                 .frame(width: 44, height: 44)
-                .background(enabled ? NethPalette.text : NethPalette.selected, in: .rect(cornerRadius: 8))
+                .background(enabled ? NethPalette.violet : NethPalette.selected, in: .rect(cornerRadius: 8))
         }
         .buttonStyle(NethPress())
         .disabled(!enabled)

@@ -18,6 +18,7 @@ typedef struct {
 } NLMessage;
 
 typedef void (*NLChunk)(const uint8_t *bytes, size_t count, void *user);
+typedef void (*NLProgress)(int32_t generated, double seconds_since_first_token, void *user);
 
 enum { NL_OK = 0, NL_STOPPED = 1, NL_ERROR = 2, NL_RETRY = 3 };
 enum { NL_FINISH_EOG = 0, NL_FINISH_OUTPUT = 1, NL_FINISH_CONTEXT = 2, NL_FINISH_STOPPED = 3 };
@@ -60,7 +61,7 @@ size_t nl_save_prompt(NLRuntime *runtime, const char *path, const char *temporar
 
 int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t message_count,
                     const NLGeneration *options,
-                    NLCancel *cancel, NLChunk chunk, void *user, int32_t *generated,
+                    NLCancel *cancel, NLChunk chunk, NLProgress progress, void *user, int32_t *generated,
                     int32_t *finish, NLPromptStats *stats, char *error, size_t error_size);
 
 #ifdef __cplusplus

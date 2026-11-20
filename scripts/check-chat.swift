@@ -115,6 +115,12 @@ struct ChatChecks {
         let planRequest = try QuattroPlan.projectRequest("Create a website with index.html and css/style.css", explicit: true)!
         let project = QuattroPlan.project(planRequest, output: nil, maximum: 4)
         precondition(project.files.map(\.path) == ["index.html", "css/style.css"])
+        try checkFileRouting()
+        let firstPass = GenerationMetrics().addingPass(tokens: 11, seconds: 2)
+        precondition(firstPass.tokens == 11 && firstPass.tokensPerSecond == 5)
+        precondition(firstPass.addingPass(tokens: 1, seconds: 0).tokens == 12)
+        let secondPass = firstPass.addingPass(tokens: 8, seconds: 1)
+        precondition(secondPass.tokens == 19 && secondPass.tokensPerSecond == 7)
         precondition(QuattroPlan.looksComplete("{\"a\": 1}", path: "data.json"))
         precondition(!QuattroPlan.looksComplete("{\"a\": ", path: "data.json"))
         try await checkQuattro(tools)
@@ -126,6 +132,29 @@ struct ChatChecks {
             try QuattroPlan.projectGrammar.write(to: directory.appending(path: "project.gbnf"), atomically: true, encoding: .utf8)
         }
         print("Checked reply continuation, migration, compression, web parsers, files and \(catalog.tools.count) callable tools.")
+    }
+
+    private static func checkFileRouting() throws {
+        let browserPlan = #"{"name":"Web","files":[{"path":"index.html","purpose":"Browser entry point"}]}"#
+        let script = try QuattroPlan.projectRequest("Make a Roblox Studio script for a day-night cycle", explicit: false)!
+        precondition(!script.needsManifest)
+        precondition(QuattroPlan.project(script, output: browserPlan, maximum: 4).files.map(\.path) == ["Script.luau"])
+
+        let game = try QuattroPlan.projectRequest("Build a Roblox game", explicit: false)!
+        precondition(game.needsManifest)
+        precondition(QuattroPlan.project(game, output: browserPlan, maximum: 4).files.map(\.path) == ["Script.luau"])
+
+        let native = try QuattroPlan.projectRequest("Write a Python script to parse HTML", explicit: false)!
+        precondition(QuattroPlan.project(native, output: nil, maximum: 4).files.map(\.path) == ["Script.py"])
+
+        let browser = try QuattroPlan.projectRequest("Make a browser game", explicit: false)!
+        precondition(QuattroPlan.project(browser, output: nil, maximum: 4).files.first?.path == "index.html")
+
+        let named = try QuattroPlan.projectRequest("/file Weather.lua Add a weather cycle", explicit: false)!
+        precondition(QuattroPlan.project(named, output: browserPlan, maximum: 4).files.map(\.path) == ["Weather.lua"])
+
+        let unspecified = try QuattroPlan.projectRequest("Create a project", explicit: false)!
+        precondition(QuattroPlan.project(unspecified, output: browserPlan, maximum: 4).files.map(\.path) == ["Draft.md"])
     }
 
     @MainActor

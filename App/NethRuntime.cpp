@@ -369,9 +369,35 @@ static void emit_text(std::string &pending, NLChunk chunk, void *user) {
     }
 }
 
+struct DecodeProgress {
+    using Clock = std::chrono::steady_clock;
+
+    NLProgress callback;
+    void *user;
+    Clock::time_point first{}, last{}, last_report{};
+    int32_t count = 0;
+    int32_t reported = 0;
+
+    ~DecodeProgress() { publish(); }
+
+    void sample(Clock::time_point time, int32_t generated) {
+        if (generated == 1) first = time;
+        last = time;
+        count = generated;
+        if (count == 1 || last - last_report >= std::chrono::milliseconds(250)) publish();
+    }
+
+    void publish() {
+        if (!callback || count == reported) return;
+        reported = count;
+        last_report = last;
+        callback(count, std::chrono::duration<double>(last - first).count(), user);
+    }
+};
+
 int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
                     const NLGeneration *options,
-                    NLCancel *cancel, NLChunk chunk, void *user, int32_t *generated,
+                    NLCancel *cancel, NLChunk chunk, NLProgress progress, void *user, int32_t *generated,
                     int32_t *finish, NLPromptStats *stats, char *error, size_t error_size) {
     using clock = std::chrono::steady_clock;
     const auto start = clock::now();
@@ -633,6 +659,7 @@ int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
         emit_text(pending, chunk, user);
     }
     *finish = window_left <= output_limit ? NL_FINISH_CONTEXT : NL_FINISH_OUTPUT;
+    DecodeProgress decode{progress, user};
     int32_t charged = 0;
     while (charged < steps && !stopped(cancel)) {
         const bool force_close = deliberating && *generated >= reasoning_limit;
@@ -679,9 +706,11 @@ int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
             if (thought_tail.size() > 16) thought_tail.erase(0, thought_tail.size() - 16);
         }
         pending += piece;
-        if (*generated == 0) stats->first_token_ms = milliseconds_since(start);
+        const auto sampled_at = clock::now();
+        if (*generated == 0) stats->first_token_ms = std::chrono::duration<double, std::milli>(sampled_at - start).count();
         ++*generated;
         ++charged;
+        decode.sample(sampled_at, *generated);
         emit_text(pending, chunk, user);
         if (charged >= steps) break;
 

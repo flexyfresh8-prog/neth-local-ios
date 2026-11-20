@@ -12,10 +12,18 @@
 struct Result {
     std::string reply;
     NLPromptStats stats{};
+    int32_t reported = 0;
 };
 
 static void collect(const uint8_t *bytes, size_t count, void *user) {
-    static_cast<std::string *>(user)->append(reinterpret_cast<const char *>(bytes), count);
+    static_cast<Result *>(user)->reply.append(reinterpret_cast<const char *>(bytes), count);
+}
+
+static void progress(int32_t count, double seconds, void *user) {
+    auto &result = *static_cast<Result *>(user);
+    assert(count > result.reported && seconds >= 0);
+    if (result.reported == 0) assert(count == 1 && seconds == 0);
+    result.reported = count;
 }
 
 static Result generate(NLRuntime *runtime, NLCancel *stop, const char *label,
@@ -28,7 +36,7 @@ static Result generate(NLRuntime *runtime, NLCancel *stop, const char *label,
     int32_t finish = 0;
     Result result;
     const auto status = nl_generate(runtime, messages.data(), messages.size(), &options, stop,
-        collect, &result.reply, &generated, &finish, &result.stats, error, sizeof(error));
+        collect, progress, &result, &generated, &finish, &result.stats, error, sizeof(error));
     if (status != NL_OK) {
         std::cerr << label << ": " << error << '\n';
         std::exit(1);
@@ -39,7 +47,7 @@ static Result generate(NLRuntime *runtime, NLCancel *stop, const char *label,
               << stats.first_token_ms << " ms" << std::endl;
     assert(stats.source == expected);
     assert((stats.reused_tokens > 0) == (expected != NL_PROMPT_REBUILT));
-    assert(generated > 0 && !result.reply.empty() && stats.first_token_ms >= 0);
+    assert(generated > 0 && generated == result.reported && !result.reply.empty() && stats.first_token_ms >= 0);
     return result;
 }
 

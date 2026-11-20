@@ -125,6 +125,11 @@ struct ModelPanel: View {
                     Text("Bundled Qwen text chats can reuse matching prompts. Storage mode saves longer prompts when you switch chats or leave the app. Saved checkpoints use up to 1.5 GiB of storage.")
                 }
                 .listRowBackground(NethPalette.surface)
+                if let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
+                    LabeledContent("App version", value: version)
+                        .foregroundStyle(NethPalette.muted)
+                        .listRowBackground(NethPalette.surface)
+                }
             }
             .scrollContentBackground(.hidden)
             .background(NethPalette.canvas)

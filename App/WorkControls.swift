@@ -5,6 +5,8 @@ struct EffortMeter: View {
     let activity: String
     let step: Int
     let total: Int
+    let running: Bool
+    let metrics: GenerationMetrics
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var fraction: Double {
@@ -14,32 +16,63 @@ struct EffortMeter: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 7) {
-                Text(verbatim: activity)
-                    .lineLimit(1)
-                    .contentTransition(.opacity)
-                    .animation(reduceMotion ? nil : NethMotion.fade, value: activity)
-                Spacer(minLength: 5)
-                if total > 1 {
-                    Text("\(step)/\(total)").monospacedDigit()
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) {
+                    status
+                    Spacer(minLength: 0)
+                    readout.fixedSize(horizontal: true, vertical: false)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    status
+                    readout
                 }
             }
             .font(.caption.weight(.medium))
-            .foregroundStyle(NethPalette.muted)
 
-            GeometryReader { layout in
-                let width = layout.size.width
-                ZStack(alignment: .leading) {
-                    Capsule().fill(NethPalette.border)
-                    Capsule().fill(NethPalette.muted)
-                        .frame(width: width * fraction)
-                        .animation(reduceMotion ? nil : NethMotion.reveal, value: fraction)
+            if running {
+                GeometryReader { layout in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(NethPalette.border)
+                        Capsule().fill(NethPalette.violet)
+                            .frame(width: layout.size.width * fraction)
+                            .phaseAnimator(reduceMotion ? [1.0] : [1.0, 0.47]) { fill, opacity in
+                                fill.opacity(opacity)
+                            } animation: { _ in .easeInOut(duration: 0.85) }
+                            .animation(reduceMotion ? nil : NethMotion.reveal, value: fraction)
+                    }
                 }
+                .frame(height: 2)
+                .accessibilityHidden(true)
             }
-            .frame(height: 2)
-            .accessibilityHidden(true)
         }
         .accessibilityElement(children: .combine)
+    }
+
+    private var status: some View {
+        HStack(spacing: 7) {
+            NethMascotMark(active: running)
+            Text(verbatim: activity)
+                .lineLimit(1)
+                .contentTransition(.opacity)
+                .animation(reduceMotion ? nil : NethMotion.fade, value: activity)
+            if running && total > 1 && step > 0 {
+                Text("\(step)/\(total)").monospacedDigit()
+            }
+        }
+        .foregroundStyle(NethPalette.muted)
+    }
+
+    private var readout: some View {
+        HStack(spacing: 9) {
+            Text("\(metrics.tokens.formatted()) \(metrics.tokens == 1 ? "token" : "tokens")")
+                .foregroundStyle(NethPalette.violet)
+                .contentTransition(.numericText())
+                .animation(reduceMotion ? nil : NethMotion.press, value: metrics.tokens)
+            let rate = metrics.tokensPerSecond?.formatted(.number.precision(.fractionLength(1))) ?? "—"
+            Text("\(rate) tok/s").foregroundStyle(NethPalette.muted)
+        }
+        .font(.system(.caption, design: .monospaced, weight: .medium))
+        .monospacedDigit()
     }
 }
 

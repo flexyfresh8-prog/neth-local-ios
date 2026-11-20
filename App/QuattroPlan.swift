@@ -1,9 +1,22 @@
 import Foundation
 
 struct QuattroProjectRequest: Sendable {
+    enum Format: Sendable {
+        case browser
+        case native(String, singleScript: Bool)
+        case unspecified
+    }
+
     let prompt: String
     let namedPaths: [String]
     let bundleName: String?
+    let format: Format
+
+    var needsManifest: Bool {
+        guard namedPaths.isEmpty else { return false }
+        if case .native(_, singleScript: true) = format { return false }
+        return true
+    }
 }
 
 enum QuattroPlan {
@@ -11,6 +24,15 @@ enum QuattroPlan {
         let name: String
         let files: [PlannedFile]
     }
+
+    private static let fileTypes: [(tags: Set<String>, ext: String)] = [
+        (["luau"], "luau"), (["lua"], "lua"),
+        (["python", "py"], "py"), (["swift"], "swift"),
+        (["typescript", "ts"], "ts"), (["javascript", "js"], "js"),
+        (["gdscript", "godot"], "gd"), (["rust"], "rs"),
+        (["pdf"], "pdf"), (["csv"], "csv"), (["json"], "json"),
+        (["markdown", "md"], "md")
+    ]
 
     static func requestsWeb(_ input: String) -> Bool {
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -34,20 +56,36 @@ enum QuattroPlan {
             }
             let path = try ChatWorkspace.supportedPath(name)
             guard !prompt.isEmpty else { throw LocalError(message: "Describe the file after its name.") }
-            return QuattroProjectRequest(prompt: prompt, namedPaths: [path], bundleName: nil)
+            return QuattroProjectRequest(prompt: prompt, namedPaths: [path], bundleName: nil, format: .unspecified)
         }
 
-        let words = Set(ToolCatalog.words(String(text.prefix(1800))))
+        let excerpt = String(text.prefix(1800))
+        let terms = ToolCatalog.words(excerpt)
+        let words = Set(terms)
+        let paths = filePaths(in: excerpt)
         let creationWords: Set<String> = ["create", "make", "build", "generate", "write", "save", "export", "design", "package"]
         let targets: Set<String> = ["file", "files", "project", "app", "website", "page", "game", "script",
-                                    "document", "pdf", "zip", "csv", "spreadsheet", "html"]
+                                    "document", "pdf", "zip", "csv", "spreadsheet", "html", "webpage"]
         let edits: Set<String> = ["edit", "rename", "delete", "list", "read"]
         guard explicit || (!words.isDisjoint(with: creationWords) && !words.isDisjoint(with: targets) && words.isDisjoint(with: edits))
         else { return nil }
-        let paths = filePaths(in: String(text.prefix(1800)))
-        let zip = paths.first { $0.lowercased().hasSuffix(".zip") }
+        let bundle = paths.first { $0.lowercased().hasSuffix(".zip") }
         let named = paths.filter { !$0.lowercased().hasSuffix(".zip") }
-        return QuattroProjectRequest(prompt: text, namedPaths: named, bundleName: zip)
+        let webTargets: Set<String> = ["browser game", "browser app", "web app", "web game", "web page"]
+        let native = fileTypes.first { !words.isDisjoint(with: $0.tags) }?.ext
+            ?? (words.contains("roblox") ? "luau" : nil)
+        let browser = !words.isDisjoint(with: ["website", "webpage"]) || (native == nil && words.contains("html"))
+            || zip(terms, terms.dropFirst()).contains { webTargets.contains("\($0.0) \($0.1)") }
+        let format: QuattroProjectRequest.Format
+        if browser {
+            format = .browser
+        } else if let native {
+            let singleScript = words.contains("script") && words.isDisjoint(with: ["project", "files", "scripts"])
+            format = .native(native, singleScript: singleScript)
+        } else {
+            format = .unspecified
+        }
+        return QuattroProjectRequest(prompt: text, namedPaths: named, bundleName: bundle, format: format)
     }
 
     static func toolPrompt(_ prompt: String, options: [ToolDefinition], observations: [ToolTrace]) -> String {
@@ -81,8 +119,14 @@ enum QuattroPlan {
         """
 
     static func manifestPrompt(_ request: QuattroProjectRequest, files: Int) -> String {
-        """
-            Plan the files for this task. Give a short project name and up to \(files) compatible text, code or PDF files. Use short relative paths and 1-sentence purposes. Use comments or prose as file content only when appropriate. Avoid binary dependencies. For a website or browser game, use HTML/CSS/JS with matching relative references.
+        let instruction: String
+        switch request.format {
+        case .browser: instruction = "Use HTML, CSS and JavaScript with matching relative references as needed."
+        case .native(let ext, _): instruction = "Include a .\(ext) file for the requested platform. Omit browser wrappers."
+        case .unspecified: instruction = "Use the requested language and platform. Omit browser wrappers."
+        }
+        return """
+            Plan the files for this task. Give a short project name and up to \(files) compatible text, code or PDF files. Use short relative paths and one-sentence purposes. Avoid binary dependencies. \(instruction)
 
             \(String(request.prompt.prefix(2100)))
             """
@@ -94,7 +138,7 @@ enum QuattroPlan {
         if !request.namedPaths.isEmpty {
             name = request.bundleName.map { String($0.dropLast(4)) } ?? (request.namedPaths[0] as NSString).deletingPathExtension
             files = request.namedPaths.map { PlannedFile(path: $0, purpose: "Implement the requested content for \($0).") }
-        } else if let output, let manifest = try? JSONDecoder().decode(Manifest.self, from: Data(output.utf8)) {
+        } else if request.needsManifest, let output, let manifest = try? JSONDecoder().decode(Manifest.self, from: Data(output.utf8)) {
             if request.bundleName == nil { name = manifest.name }
             var seen: Set<String> = []
             for file in manifest.files {
@@ -102,16 +146,27 @@ enum QuattroPlan {
                     files.append(PlannedFile(path: path, purpose: String(file.purpose.prefix(175))))
                 }
             }
+            let extensions = Set(files.prefix(maximum).map { ($0.path as NSString).pathExtension.lowercased() })
+            switch request.format {
+            case .browser: break
+            case .native(let ext, _):
+                if !extensions.contains(ext) || extensions.contains("html") { files.removeAll() }
+            case .unspecified:
+                if extensions.contains("html") { files.removeAll() }
+            }
         }
         if files.isEmpty {
-            let words = Set(ToolCatalog.words(String(request.prompt.prefix(1600))))
-            if !words.isDisjoint(with: ["game", "website", "browser", "html", "webpage"]) {
+            switch request.format {
+            case .browser:
                 files = [PlannedFile(path: "index.html", purpose: "Page structure referencing styles.css and app.js."),
                          PlannedFile(path: "styles.css", purpose: "Layout and visual styling for the page."),
                          PlannedFile(path: "app.js", purpose: "Working application or game logic.")]
-            } else {
-                let ext = ["pdf", "csv", "json", "swift", "py", "md"].first(where: words.contains) ?? "md"
-                files = [PlannedFile(path: "Draft.\(ext)", purpose: "Complete the user's requested file.")]
+            case .native(let ext, let singleScript):
+                let basename = singleScript || ext == "luau" || ext == "lua" ? "Script" : "Draft"
+                files = [PlannedFile(path: "\(basename).\(ext)", purpose: "Complete the requested file in its native format.")]
+                if request.bundleName == nil, singleScript { name = basename }
+            case .unspecified:
+                files = [PlannedFile(path: "Draft.md", purpose: "Complete the user's requested file.")]
             }
         }
         let slug = String(ToolCatalog.words(name).joined(separator: "-").prefix(44))

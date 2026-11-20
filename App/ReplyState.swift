@@ -1,5 +1,14 @@
 import Foundation
 
+struct GenerationMetrics: Equatable, Sendable {
+    var tokens = 0
+    var tokensPerSecond: Double?
+
+    func addingPass(tokens count: Int, seconds: Double) -> Self {
+        Self(tokens: tokens + count, tokensPerSecond: count > 1 && seconds > 0 ? Double(count - 1) / seconds : nil)
+    }
+}
+
 enum EffortPreset: String, CaseIterable, Identifiable, Codable, Sendable {
     case quick, balanced, deep, maximum
 

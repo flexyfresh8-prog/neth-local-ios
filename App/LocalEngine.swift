@@ -26,8 +26,9 @@ enum EngineEvent: Sendable {
     case loading(String)
     case ready(RuntimeProfile)
     case text(String)
+    case progress(tokens: Int, seconds: Double)
     case prompt(PromptMetrics)
-    case finished(ReplyFinish, count: Int, seconds: Double)
+    case finished(ReplyFinish)
 }
 
 struct PromptMetrics: Sendable {
@@ -61,7 +62,6 @@ final class GenerationStop: @unchecked Sendable {
 
 private final class TokenSink {
     let continuation: AsyncThrowingStream<EngineEvent, Error>.Continuation
-    var firstToken: TimeInterval?
 
     init(_ continuation: AsyncThrowingStream<EngineEvent, Error>.Continuation) {
         self.continuation = continuation
@@ -71,8 +71,13 @@ private final class TokenSink {
 private let receiveChunk: NLChunk = { bytes, count, user in
     guard let bytes, let user else { return }
     let sink = Unmanaged<TokenSink>.fromOpaque(user).takeUnretainedValue()
-    if sink.firstToken == nil { sink.firstToken = ProcessInfo.processInfo.systemUptime }
     sink.continuation.yield(.text(String(decoding: UnsafeBufferPointer(start: bytes, count: count), as: UTF8.self)))
+}
+
+private let receiveProgress: NLProgress = { count, seconds, user in
+    guard let user else { return }
+    let sink = Unmanaged<TokenSink>.fromOpaque(user).takeUnretainedValue()
+    sink.continuation.yield(.progress(tokens: Int(count), seconds: seconds))
 }
 
 final class LocalEngine: @unchecked Sendable {
@@ -140,7 +145,7 @@ final class LocalEngine: @unchecked Sendable {
             work.async {
                 do {
                     guard !stop.cancelled else {
-                        continuation.yield(.finished(.stopped, count: 0, seconds: 0))
+                        continuation.yield(.finished(.stopped))
                         continuation.finish()
                         return
                     }
@@ -200,12 +205,12 @@ final class LocalEngine: @unchecked Sendable {
         let projector = settings.projector.map { strdup($0.path) } ?? nil
         defer { free(projector) }
 
-        let sink = TokenSink(continuation)
-        let opaque = Unmanaged.passUnretained(sink).toOpaque()
+        let sink = Unmanaged.passRetained(TokenSink(continuation))
+        defer { sink.release() }
+        let opaque = sink.toOpaque()
         for metal in routes {
             var error = [CChar](repeating: 0, count: 512)
             let errorLength = error.count
-            let start = ProcessInfo.processInfo.systemUptime
             let backend = metal ? "Metal" : "CPU"
             if runtime == nil {
                 continuation.yield(.loading(backend))
@@ -219,7 +224,7 @@ final class LocalEngine: @unchecked Sendable {
             guard let runtime else {
                 if metal && !stop.cancelled { continue }
                 if stop.cancelled {
-                    continuation.yield(.finished(.stopped, count: 0, seconds: 0))
+                    continuation.yield(.finished(.stopped))
                     return
                 }
                 let message = String(cString: error)
@@ -257,7 +262,8 @@ final class LocalEngine: @unchecked Sendable {
             var stats = NLPromptStats()
             let status = messages.withUnsafeBufferPointer { messages in
                 nl_generate(runtime, messages.baseAddress, messages.count, &options,
-                            stop.handle, receiveChunk, opaque, &generated, &finish, &stats, &error, errorLength)
+                            stop.handle, receiveChunk, receiveProgress, opaque,
+                            &generated, &finish, &stats, &error, errorLength)
             }
             if status == NL_RETRY && metal && generated == 0 {
                 releaseRuntime()
@@ -267,7 +273,6 @@ final class LocalEngine: @unchecked Sendable {
                 let message = String(cString: error)
                 throw LocalError(message: message.isEmpty ? "Local generation failed." : message)
             }
-            let elapsed = max(0.001, ProcessInfo.processInfo.systemUptime - (sink.firstToken ?? start))
             let reason: ReplyFinish
             switch finish {
             case Int32(NL_FINISH_OUTPUT): reason = .outputLimit
@@ -279,7 +284,7 @@ final class LocalEngine: @unchecked Sendable {
             if stats.prompt_tokens > 0, stats.first_token_ms >= 0 || status == NL_OK {
                 continuation.yield(.prompt(PromptMetrics(stats)))
             }
-            continuation.yield(.finished(reason, count: Int(generated), seconds: elapsed))
+            continuation.yield(.finished(reason))
             return
         }
     }

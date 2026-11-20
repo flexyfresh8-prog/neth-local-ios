@@ -9,6 +9,7 @@ enum NethPalette {
     static let border = Color(white: 0.24)
     static let muted = Color(white: 0.65)
     static let text = Color(white: 0.94)
+    static let violet = Color(red: 0.77, green: 0.67, blue: 0.96)
 }
 
 enum NethMotion {
@@ -35,14 +36,17 @@ struct NethMascot: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Text(verbatim: " .-----. ")
-            Text(verbatim: blinking ? " | - - | " : " | o o | ")
+            Text(verbatim: "     *     ").foregroundStyle(NethPalette.violet)
+            Text(verbatim: "     |     ").foregroundStyle(NethPalette.muted)
+            Text(verbatim: " .---+---. ")
+            Text(verbatim: blinking ? "[| -   - |]" : "[| o   o |]")
+                .foregroundStyle(NethPalette.violet)
                 .contentTransition(.opacity)
                 .animation(reduceMotion ? nil : NethMotion.press, value: blinking)
-            Text(verbatim: " |  _  | ")
-            Text(verbatim: " '-----' ")
+            Text(verbatim: " |   _   | ")
+            Text(verbatim: " '-------' ")
         }
-        .font(.system(.title2, design: .monospaced, weight: .regular))
+        .font(.system(size: 14, weight: .medium, design: .monospaced))
         .foregroundStyle(NethPalette.text)
         .fixedSize()
         .accessibilityHidden(true)
@@ -56,7 +60,6 @@ struct NethMascot: View {
                     try await Task.sleep(for: .milliseconds(180))
                     blinking = false
                 }
-            } catch is CancellationError {
             } catch {}
         }
     }
@@ -65,13 +68,22 @@ struct NethMascot: View {
 struct NethMascotMark: View {
     var active = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    private static let working = ["[o_o]", "[o_>]", "[>_o]", "[o_o]", "[-_-]"]
 
     var body: some View {
-        Text(verbatim: active ? "[o.o]" : "[o_o]")
-            .font(.system(.caption, design: .monospaced, weight: .semibold))
-            .foregroundStyle(NethPalette.muted)
-            .contentTransition(.opacity)
-            .animation(reduceMotion ? nil : NethMotion.fade, value: active)
-            .accessibilityHidden(true)
+        Group {
+            if active && !reduceMotion {
+                TimelineView(.periodic(from: .now, by: 0.4)) { tick in
+                    let frame = abs(Int(tick.date.timeIntervalSinceReferenceDate * 2.5) % Self.working.count)
+                    Text(verbatim: Self.working[frame])
+                }
+            } else {
+                Text(verbatim: active ? "[o.o]" : "[o_o]")
+            }
+        }
+        .font(.system(.caption, design: .monospaced, weight: .semibold))
+        .foregroundStyle(active ? NethPalette.violet : NethPalette.muted)
+        .animation(reduceMotion ? nil : NethMotion.fade, value: active)
+        .accessibilityHidden(true)
     }
 }
