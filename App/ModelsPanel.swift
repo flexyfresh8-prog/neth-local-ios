@@ -31,6 +31,7 @@ struct ModelPanel: View {
                     Link("Model details", destination: ModelAsset.modelCard)
                         .font(.footnote)
                 } header: { Text("Qwen3.5") }
+                .listRowBackground(NethPalette.surface)
 
                 Section {
                     ForEach(models.installed) { model in
@@ -44,7 +45,7 @@ struct ModelPanel: View {
                                 }
                                 Spacer()
                                 if models.selectedID == model.id {
-                                    Image(systemName: "checkmark.circle.fill").foregroundStyle(NethPalette.accent)
+                                    Image(systemName: "checkmark.circle.fill").foregroundStyle(NethPalette.text)
                                 }
                             }
                         }
@@ -60,6 +61,7 @@ struct ModelPanel: View {
                     }
                     .disabled(models.importing || inferenceBusy)
                 } header: { Text("On this iPad") }
+                .listRowBackground(NethPalette.surface)
 
                 Section {
                     Picker("Context", selection: $context) {
@@ -79,8 +81,11 @@ struct ModelPanel: View {
                         }
                     }
                     Toggle("Compact older chat turns", isOn: $compactHistory)
+                        .tint(NethPalette.muted)
                     Toggle("Thinking mode", isOn: $thinking)
+                        .tint(NethPalette.muted)
                     Toggle("CPU only", isOn: $cpuOnly)
+                        .tint(NethPalette.muted)
                     if let active {
                         LabeledContent("Active context", value: active.detail)
                     }
@@ -90,6 +95,7 @@ struct ModelPanel: View {
                         Text("iPadOS reports \(LocalModels.size(available)) of additional memory available to this app.")
                     }
                 }
+                .listRowBackground(NethPalette.surface)
                 .disabled(inferenceBusy)
 
                 Section {
@@ -118,8 +124,11 @@ struct ModelPanel: View {
                 } header: { Text("Prompt checkpoints") } footer: {
                     Text("Bundled Qwen text chats can reuse matching prompts. Storage mode saves longer prompts when you switch chats or leave the app. Saved checkpoints use up to 1.5 GiB of storage.")
                 }
+                .listRowBackground(NethPalette.surface)
             }
-            .navigationTitle("Models")
+            .scrollContentBackground(.hidden)
+            .background(NethPalette.canvas)
+            .navigationTitle("Models & context")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
         }
@@ -160,7 +169,7 @@ struct ModelPanel: View {
                             .labelStyle(.iconOnly)
                             .disabled(inferenceBusy)
                     } else {
-                        Image(systemName: "checkmark.circle.fill").foregroundStyle(NethPalette.accent)
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(NethPalette.text)
                             .accessibilityLabel("Downloaded")
                     }
                 } else if models.activeDownload == asset {

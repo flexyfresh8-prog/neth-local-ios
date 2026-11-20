@@ -1,17 +1,6 @@
 import SwiftUI
 import UIKit
 
-enum NethPalette {
-    static let canvas = Color(red: 0.048, green: 0.053, blue: 0.072)
-    static let rail = Color(red: 0.074, green: 0.080, blue: 0.111)
-    static let surface = Color(red: 0.10, green: 0.112, blue: 0.155)
-    static let inset = Color(red: 0.060, green: 0.066, blue: 0.09)
-    static let border = Color(red: 0.185, green: 0.194, blue: 0.26)
-    static let muted = Color(red: 0.66, green: 0.70, blue: 0.79)
-    static let accent = Color(red: 0.77, green: 0.69, blue: 1)
-    static let green = Color(red: 0.57, green: 0.92, blue: 0.81)
-}
-
 struct ChatMessageRow: View, Equatable {
     let message: ChatMessage
     let streaming: Bool
@@ -44,107 +33,113 @@ struct ChatMessageRow: View, Equatable {
                     .accessibilityLabel("Attached photo")
             }
             Text(verbatim: message.text)
-                .foregroundStyle(.white)
+                .foregroundStyle(NethPalette.text)
+                .lineSpacing(4)
                 .textSelection(.enabled)
         }
-        .padding(.horizontal, 16)
+        .padding(.horizontal, 17)
         .padding(.vertical, 13)
-        .background(NethPalette.accent.opacity(0.13), in: .rect(cornerRadius: 18))
-        .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(NethPalette.accent.opacity(0.14)))
-        .frame(maxWidth: 570, alignment: .trailing)
+        .background(NethPalette.surface, in: .rect(cornerRadius: 17))
+        .frame(maxWidth: 550, alignment: .trailing)
         .frame(maxWidth: .infinity, alignment: .trailing)
     }
 
     private var assistantMessage: some View {
         let content = ReplyFormat(message.text)
-        return HStack(alignment: .top, spacing: 12) {
-            Image(systemName: message.metadata?.quattro == true ? "square.grid.2x2" : "waveform")
-                .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(NethPalette.accent)
-                .frame(width: 29, height: 29)
-                .background(NethPalette.accent.opacity(0.12), in: .rect(cornerRadius: 8))
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 13) {
-                if let notice = message.notice {
-                    Label(notice, systemImage: "info.circle")
-                        .font(.footnote)
-                        .foregroundStyle(NethPalette.muted)
-                }
-                if message.text.isEmpty && streaming {
-                    HStack(spacing: 10) {
-                        ProgressView().controlSize(.small)
-                        Text(activity ?? "Preparing…").font(.subheadline)
-                    }
+        return VStack(alignment: .leading, spacing: 13) {
+            HStack(spacing: 9) {
+                NethMascotMark(active: streaming)
+                Text(message.metadata?.quattro == true ? "Quattro" : "Neth Local")
+                    .font(.subheadline.weight(.semibold))
+                    .accessibilityAddTraits(.isHeader)
+            }
+            if let notice = message.notice {
+                Label(notice, systemImage: "info.circle")
+                    .font(.footnote)
                     .foregroundStyle(NethPalette.muted)
-                    .padding(.vertical, 5)
+            }
+            if message.text.isEmpty && streaming {
+                HStack(spacing: 9) {
+                    ProgressView().controlSize(.small)
+                    Text(activity ?? "Preparing…").font(.subheadline)
                 }
-                if let thought = content.reasoning, !thought.isEmpty {
-                    DisclosureGroup(streaming && !content.reasoningComplete ? "Thinking…" : "Reasoning") {
-                        Text(verbatim: thought)
-                            .foregroundStyle(NethPalette.muted)
-                            .textSelection(.enabled)
-                            .padding(.top, 7)
+                .foregroundStyle(NethPalette.muted)
+            }
+            if let thought = content.reasoning, !thought.isEmpty {
+                DisclosureGroup(streaming && !content.reasoningComplete ? "Thinking…" : "Reasoning") {
+                    Text(verbatim: thought)
+                        .foregroundStyle(NethPalette.muted)
+                        .textSelection(.enabled)
+                        .padding(.top, 6)
+                }
+                .font(.footnote)
+            }
+            ForEach(Array(content.blocks.enumerated()), id: \.offset) { _, block in
+                switch block {
+                case .prose(let prose):
+                    Text((try? AttributedString(markdown: prose,
+                                               options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+                         ?? AttributedString(prose))
+                        .foregroundStyle(NethPalette.text)
+                        .textSelection(.enabled)
+                        .lineSpacing(5)
+                case .code(let language, let code):
+                    CodePanel(language: language, code: code, allowSave: allowActions && !streaming) {
+                        save(code, "Snippet.\(Self.extensionForLanguage(language))")
+                    }
+                }
+            }
+            if let evidence = message.evidence { sources(evidence) }
+            if let metadata = message.metadata {
+                ForEach(metadata.files) { WorkspaceFileCard(file: $0) }
+                if !metadata.trace.isEmpty {
+                    DisclosureGroup {
+                        VStack(alignment: .leading, spacing: 9) {
+                            ForEach(metadata.trace) { item in
+                                Label(item.title, systemImage: item.failed ? "exclamationmark.circle" : "checkmark.circle")
+                                Text(verbatim: item.detail)
+                                    .foregroundStyle(NethPalette.muted)
+                                    .textSelection(.enabled)
+                            }
+                        }
+                        .padding(.top, 6)
+                    } label: {
+                        Label("Quattro activity · \(metadata.trace.count)", systemImage: "square.grid.2x2")
                     }
                     .font(.footnote)
                 }
-                ForEach(Array(content.blocks.enumerated()), id: \.offset) { _, block in
-                    switch block {
-                    case .prose(let prose):
-                        Text((try? AttributedString(markdown: prose,
-                                                   options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
-                             ?? AttributedString(prose))
-                            .textSelection(.enabled)
-                            .lineSpacing(4)
-                    case .code(let language, let code):
-                        CodePanel(language: language, code: code, allowSave: allowActions && !streaming) {
-                            save(code, "Snippet.\(Self.extensionForLanguage(language))")
-                        }
-                    }
-                }
-                if let evidence = message.evidence { sources(evidence) }
-                if let metadata = message.metadata {
-                    ForEach(metadata.files) { WorkspaceFileCard(file: $0) }
-                    if !metadata.trace.isEmpty {
-                        DisclosureGroup {
-                            VStack(alignment: .leading, spacing: 9) {
-                                ForEach(metadata.trace) { item in
-                                    Label(item.title, systemImage: item.failed ? "exclamationmark.circle" : "checkmark.circle")
-                                        .foregroundStyle(item.failed ? NethPalette.accent : NethPalette.green)
-                                    Text(verbatim: item.detail)
-                                        .foregroundStyle(NethPalette.muted)
-                                        .textSelection(.enabled)
-                                }
-                            }
-                            .padding(.top, 7)
-                        } label: {
-                            Label("Quattro activity · \(metadata.trace.count)", systemImage: "square.grid.2x2")
-                        }
-                        .font(.footnote)
-                    }
-                }
-                if !content.answer.isEmpty && !streaming {
-                    HStack(spacing: 8) {
-                        CopyControl(content: content.answer, accessibilityTitle: "Copy reply", compact: true)
-                        Button { save(content.answer, "Reply.md") } label: {
-                            Label("Save as file", systemImage: "doc.badge.plus")
-                                .font(.caption.weight(.semibold))
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(!allowActions)
-                    }
-                }
-                if !streaming, let reason = message.metadata?.finish.label ?? (content.hasOpenFence ? "Open code block" : nil) {
-                    ViewThatFits(in: .horizontal) {
-                        HStack { Text(verbatim: reason); resumeButton }
-                        VStack(alignment: .leading, spacing: 5) { Text(verbatim: reason); resumeButton }
-                    }
-                    .font(.caption)
-                    .foregroundStyle(NethPalette.muted)
+            }
+            if !content.answer.isEmpty && !streaming {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 6) { replyActions(content.answer) }
+                    VStack(alignment: .leading, spacing: 3) { replyActions(content.answer) }
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.top, 3)
+            if !streaming, let reason = message.metadata?.finish.label ?? (content.hasOpenFence ? "Open code block" : nil) {
+                ViewThatFits(in: .horizontal) {
+                    HStack { Text(verbatim: reason); resumeButton }
+                    VStack(alignment: .leading, spacing: 5) { Text(verbatim: reason); resumeButton }
+                }
+                .font(.caption)
+                .foregroundStyle(NethPalette.muted)
+            }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func replyActions(_ answer: String) -> some View {
+        CopyControl(content: answer, accessibilityTitle: "Copy reply", compact: true)
+        Button { save(answer, "Reply.md") } label: {
+            Label("Save as file", systemImage: "doc.badge.plus")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(NethPalette.muted)
+                .padding(.horizontal, 7)
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(NethPress())
+        .disabled(!allowActions)
     }
 
     private static func extensionForLanguage(_ language: String) -> String {
@@ -177,17 +172,19 @@ struct ChatMessageRow: View, Equatable {
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(verbatim: source.title)
                                     .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.white)
+                                    .foregroundStyle(NethPalette.text)
                                     .lineLimit(2)
                                 Text("[\(index + 1)]  \(source.url.host ?? source.url.absoluteString)")
                                     .font(.caption2)
                                     .foregroundStyle(NethPalette.muted)
                                     .lineLimit(1)
                             }
-                            .frame(width: 171, height: 46, alignment: .leading)
-                            .padding(8)
-                            .background(NethPalette.surface, in: .rect(cornerRadius: 9))
-                            .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(NethPalette.border))
+                            .frame(width: 170, alignment: .leading)
+                            .padding(10)
+                            .frame(minHeight: 60, alignment: .leading)
+                            .background(NethPalette.inset, in: .rect(cornerRadius: 9))
+                            .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(NethPalette.border)
+                                .allowsHitTesting(false))
                         }
                     }
                 }
@@ -205,16 +202,15 @@ private struct CodePanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
-                Image(systemName: "chevron.left.forwardslash.chevron.right")
-                    .foregroundStyle(NethPalette.accent)
-                    .accessibilityHidden(true)
                 Text(verbatim: language).font(.system(.caption, design: .monospaced))
                 Spacer()
                 if allowSave && !code.isEmpty {
                     Button(action: save) {
-                        Image(systemName: "doc.badge.plus").frame(width: 36, height: 38)
+                        Image(systemName: "doc.badge.plus")
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(NethPress())
                     .accessibilityLabel("Save code as file")
                 }
                 CopyControl(content: code, accessibilityTitle: "Copy \(language) code", compact: false)
@@ -222,13 +218,13 @@ private struct CodePanel: View {
             .font(.caption)
             .foregroundStyle(NethPalette.muted)
             .padding(.horizontal, 12)
-            .frame(minHeight: 42)
+            .frame(minHeight: 44)
             .background(NethPalette.surface)
-            Divider().overlay(NethPalette.border)
+            Rectangle().fill(NethPalette.border).frame(height: 1)
             ScrollView(.horizontal) {
                 Text(verbatim: code)
                     .font(.system(.subheadline, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.94))
+                    .foregroundStyle(NethPalette.text)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: true, vertical: false)
                     .padding(13)
@@ -237,7 +233,7 @@ private struct CodePanel: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(NethPalette.inset)
         .clipShape(.rect(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(NethPalette.border))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(NethPalette.border).allowsHitTesting(false))
     }
 }
 
@@ -245,6 +241,7 @@ private struct CopyControl: View {
     let content: String
     let accessibilityTitle: String
     let compact: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var copiedAt: Date?
 
     var body: some View {
@@ -254,13 +251,15 @@ private struct CopyControl: View {
         } label: {
             Label(copiedAt != nil ? "Copied" : compact ? "Copy reply" : "Copy",
                   systemImage: copiedAt != nil ? "checkmark" : "doc.on.doc")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(copiedAt != nil ? NethPalette.green : NethPalette.muted)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(copiedAt != nil ? NethPalette.text : NethPalette.muted)
                 .padding(.horizontal, 7)
-                .frame(minHeight: compact ? 34 : 38)
+                .frame(minHeight: 44)
+                .contentTransition(.opacity)
                 .contentShape(Rectangle())
+                .animation(reduceMotion ? nil : NethMotion.fade, value: copiedAt != nil)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(NethPress())
         .disabled(content.isEmpty)
         .accessibilityLabel(copiedAt == nil ? accessibilityTitle : "Copied")
         .task(id: copiedAt) {
