@@ -238,6 +238,7 @@ actor ChatArchive {
                 """, db: handle)
             try addReplyMetadataIfNeeded(handle)
             do {
+                let needsInitialIndex = try lacksSearchIndex(handle)
                 try execute("""
                     CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
                     USING fts5(body, content='messages', content_rowid='id');
@@ -253,6 +254,9 @@ actor ChatArchive {
                         INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body);
                     END;
                     """, db: handle)
+                if needsInitialIndex {
+                    try execute("INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')", db: handle)
+                }
             } catch let error as LocalError where error.message.contains("no such module: fts5") {
                 hasFTS = false
             }
@@ -262,6 +266,17 @@ actor ChatArchive {
         }
         connection = handle
         return handle
+    }
+
+    private func lacksSearchIndex(_ db: OpaquePointer) throws -> Bool {
+        var statement: OpaquePointer?
+        let sql = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'"
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK,
+              let statement else { throw databaseError(db) }
+        defer { sqlite3_finalize(statement) }
+        let result = sqlite3_step(statement)
+        guard result == SQLITE_ROW || result == SQLITE_DONE else { throw databaseError(db) }
+        return result == SQLITE_DONE
     }
 
     private func addReplyMetadataIfNeeded(_ db: OpaquePointer) throws {
