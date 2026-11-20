@@ -40,7 +40,7 @@ xcrun --sdk iphoneos clang++ -target "$target" -isysroot "$sdk" -std=c++17 -O2 \
 
 xcrun --sdk iphoneos swiftc -target "$target" -sdk "$sdk" -swift-version 5 -O \
     -parse-as-library -module-name NethLocal -import-objc-header App/NethRuntime.h \
-    -F "$app/Frameworks" -framework llama -lc++ \
+    -F "$app/Frameworks" -framework llama -lc++ -lsqlite3 \
     -Xlinker -rpath -Xlinker '@executable_path/Frameworks' \
     App/*.swift "$work/NethRuntime.o" -o "$app/NethLocal"
 
@@ -74,6 +74,12 @@ done
 find "$app" -type d -name _CodeSignature -prune -exec rm -rf {} +
 xcrun otool -L "$app/NethLocal"
 
-rm -f "$output/NethLocal-unsigned.ipa"
+rm -f "$output/NethLocal-unsigned.ipa" "$output/NethLocal-Impactor.ipa"
 ditto -c -k --norsrc --keepParent "$payload" "$output/NethLocal-unsigned.ipa"
 python3 scripts/verify-ipa.py "$output/NethLocal-unsigned.ipa"
+
+# Impactor reads capability requests from the original main executable.
+# It creates its own Apple ID signature and provisioning profile at install.
+codesign --force --sign - --identifier com.neth.local --entitlements NethLocal.entitlements "$app/NethLocal"
+ditto -c -k --norsrc --keepParent "$payload" "$output/NethLocal-Impactor.ipa"
+python3 scripts/verify-ipa.py "$output/NethLocal-Impactor.ipa" --impactor

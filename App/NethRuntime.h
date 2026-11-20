@@ -29,9 +29,11 @@ void nl_cancel_free(NLCancel *cancel);
 NLRuntime *nl_open(const char *model_path, int32_t context, bool metal,
                   NLCancel *cancel, char *error, size_t error_size);
 void nl_close(NLRuntime *runtime);
+int32_t nl_context_window(const NLRuntime *runtime);
+bool nl_context_compact(const NLRuntime *runtime);
 
 int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t message_count,
-                    const char *projector_path, bool thinking, int32_t output_limit,
+                    const char *projector_path, const char *reference, bool thinking, int32_t output_limit,
                     NLCancel *cancel, NLChunk chunk, void *user, int32_t *generated,
                     char *error, size_t error_size);
 

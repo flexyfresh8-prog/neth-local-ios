@@ -4,535 +4,596 @@ import SwiftUI
 import UniformTypeIdentifiers
 import UIKit
 
-private let surface = Color(red: 0.08, green: 0.08, blue: 0.105)
-private let panel = Color(red: 0.115, green: 0.112, blue: 0.15)
-private let accent = Color(red: 0.75, green: 0.69, blue: 1)
-
 @main
 struct NethLocalApp: App {
     var body: some Scene {
         WindowGroup {
             ChatScreen()
                 .preferredColorScheme(.dark)
-                .tint(accent)
+                .tint(NethPalette.accent)
         }
-    }
-}
-
-@MainActor
-private final class LocalChat: ObservableObject {
-    @Published private(set) var messages: [ChatMessage] = []
-    @Published private(set) var running = false
-    @Published private(set) var status: String?
-    @Published var problem: String?
-
-    private let engine = LocalEngine()
-    private var activeStop: GenerationStop?
-
-    func send(_ text: String, photo: URL?, settings: EngineSettings) {
-        guard !running else { return }
-        messages.append(ChatMessage(role: .user, text: text, photo: photo))
-        let prompt = Array(messages.suffix(24))
-        messages.append(ChatMessage(role: .assistant, text: ""))
-        let stop = GenerationStop()
-        activeStop = stop
-        running = true
-        status = "Loading model"
-
-        Task {
-            defer {
-                if messages.last?.role == .assistant, messages.last?.text.isEmpty == true {
-                    messages.removeLast()
-                }
-                running = false
-                activeStop = nil
-            }
-            var backend = ""
-            do {
-                for try await event in engine.stream(history: prompt, settings: settings, stop: stop) {
-                    switch event {
-                    case .backend(let name):
-                        backend = name
-                        status = "Preparing · \(name)"
-                    case .text(let part):
-                        if messages.last?.text.isEmpty == true { status = "Generating · \(backend)" }
-                        messages[messages.count - 1].text += part
-                    case .finished(let count, let seconds):
-                        status = String(format: "%.1f tok/s · %@", Double(count - 1) / seconds, backend)
-                    }
-                }
-                if status?.hasPrefix("Preparing") == true || status?.hasPrefix("Generating") == true {
-                    status = nil
-                }
-            } catch {
-                status = nil
-                problem = error.localizedDescription
-            }
-        }
-    }
-
-    func stop() { activeStop?.request() }
-
-    func unload() {
-        stop()
-        engine.unload()
-    }
-
-    func reset() {
-        guard !running else { return }
-        for message in messages {
-            if let photo = message.photo { try? FileManager.default.removeItem(at: photo) }
-        }
-        messages.removeAll()
-        status = nil
     }
 }
 
 @MainActor
 private struct ChatScreen: View {
+    private enum Sheet: String, Identifiable {
+        case history, search, models
+        var id: Self { self }
+    }
+
     @StateObject private var models = LocalModels()
     @StateObject private var chat = LocalChat()
-    @AppStorage("contextSize") private var context = 1024
+    @AppStorage("contextSize") private var context = 4096
     @AppStorage("cpuOnly") private var cpuOnly = false
     @AppStorage("thinking") private var thinking = false
-    @Environment(\.scenePhase) private var scenePhase
-    @FocusState private var composing: Bool
+    @Environment(\.scenePhase) private var scene
+    @FocusState private var typing: Bool
     @State private var draft = ""
-    @State private var showModels = false
-    @State private var confirmReset = false
+    @State private var web = false
+    @State private var sheet: Sheet?
+    @State private var deleting: Conversation?
     @State private var photoItem: PhotosPickerItem?
     @State private var photo: URL?
-    @State private var photoLoading = false
+    @State private var loadingPhoto = false
+    @State private var nearBottom = true
 
-    private var supportsPhotos: Bool { models.current?.isPreset == true && models.projector != nil }
-    private var readyToSend: Bool {
-        !chat.running && !photoLoading && models.current != nil
+    private var canAttach: Bool { models.current?.isPreset == true && models.projector != nil }
+    private var busy: Bool { chat.running || chat.opening }
+    private var canSend: Bool {
+        !busy && !loadingPhoto && models.current != nil
             && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || photo != nil)
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider()
-            if chat.messages.isEmpty { emptyState } else { transcript }
-            if let status = chat.status {
-                Text(status)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .padding(.bottom, 8)
-                    .accessibilityLabel(status)
-            }
-            composer
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(surface.ignoresSafeArea())
-        .sheet(isPresented: $showModels) {
-            ModelPanel(models: models, context: $context, cpuOnly: $cpuOnly,
-                       thinking: $thinking, inferenceBusy: chat.running) { chat.unload() }
-        }
-        .confirmationDialog("Clear this chat?", isPresented: $confirmReset, titleVisibility: .visible) {
-            Button("Clear chat", role: .destructive) {
-                chat.reset()
-                clearPhoto()
-                draft = ""
+        GeometryReader { geometry in
+            let wide = geometry.size.width >= 868
+            HStack(spacing: 0) {
+                if wide {
+                    sidebar(inSheet: false).frame(width: 254)
+                    Rectangle().fill(NethPalette.border).frame(width: 1)
+                }
+                VStack(spacing: 0) {
+                    header(showNavigation: !wide)
+                    Rectangle().fill(NethPalette.border).frame(height: 1)
+                    if chat.messages.isEmpty { startScreen } else { transcript }
+                    composer
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(NethPalette.canvas)
             }
         }
-        .alert("Neth Local", isPresented: Binding(get: { chat.problem != nil }, set: { if !$0 { chat.problem = nil } })) {
-            Button("OK", role: .cancel) { chat.problem = nil }
-        } message: {
-            Text(chat.problem ?? "")
+        .background(NethPalette.canvas.ignoresSafeArea())
+        .task { await chat.restore() }
+        .sheet(item: $sheet) { selected in
+            switch selected {
+            case .history: sidebar(inSheet: true).presentationDetents([.large])
+            case .search:
+                ChatSearchPanel(search: chat.search) { hit in
+                    changeChat(hit.conversationID, at: hit.id)
+                }
+                .presentationDetents([.large])
+            case .models:
+                ModelPanel(models: models, context: $context, cpuOnly: $cpuOnly,
+                           thinking: $thinking, inferenceBusy: busy) { chat.unload() }
+            }
         }
-        .onChange(of: photoItem) { _, item in
-            guard let item else { return }
-            loadPhoto(item)
-        }
+        .alert("Delete chat?", isPresented: Binding(
+            get: { deleting != nil }, set: { if !$0 { deleting = nil } }), presenting: deleting) { selection in
+                Button("Delete", role: .destructive) { Task { await chat.remove(selection) } }
+                Button("Cancel", role: .cancel) {}
+            } message: { selection in
+                Text("“\(selection.title)” and its attachments will be deleted from this iPad.")
+            }
+        .alert("Neth Local", isPresented: Binding(
+            get: { chat.problem != nil }, set: { if !$0 { chat.problem = nil } })) {
+                Button("OK", role: .cancel) { chat.problem = nil }
+            } message: {
+                Text(chat.problem ?? "")
+            }
+        .onChange(of: photoItem) { _, item in if let item { preparePhoto(item) } }
         .onChange(of: models.selectedID) { _, _ in
             chat.unload()
-            if !supportsPhotos { clearPhoto() }
+            if !canAttach { clearAttachment() }
         }
-        .onChange(of: models.projector) { _, _ in
-            if !supportsPhotos { clearPhoto() }
-        }
-        .onChange(of: scenePhase) { _, phase in
-            if phase == .background { chat.unload() }
-        }
+        .onChange(of: models.projector) { _, _ in if !canAttach { clearAttachment() } }
+        .onChange(of: scene) { _, phase in if phase == .background { chat.unload() } }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
             chat.unload()
         }
     }
 
-    private var header: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "waveform")
-                .font(.system(size: 20, weight: .semibold))
-                .foregroundStyle(accent)
-                .frame(width: 42, height: 42)
-                .background(accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 13))
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 3) {
-                Text("Neth Local").font(.system(.headline, design: .rounded, weight: .bold))
-                Text(models.current?.title ?? "On-device AI")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+    private func sidebar(inSheet: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Image(systemName: "waveform")
+                    .foregroundStyle(NethPalette.accent)
+                    .font(.system(size: 17, weight: .semibold))
+                    .frame(width: 32, height: 32)
+                    .background(NethPalette.accent.opacity(0.11), in: .rect(cornerRadius: 9))
+                    .accessibilityHidden(true)
+                Text("Neth Local").font(.title3.weight(.semibold))
+                Spacer()
+                if inSheet {
+                    Button("Done") { sheet = nil }
+                        .font(.subheadline.weight(.semibold))
+                }
             }
-            Spacer()
-            Button {
-                confirmReset = true
-            } label: {
-                Image(systemName: "square.and.pencil")
-                    .frame(minWidth: 34, minHeight: 34)
-            }
-            .disabled(chat.messages.isEmpty || chat.running)
-            .accessibilityLabel("New chat")
-            Button { showModels = true } label: {
-                Label("Models", systemImage: "square.stack")
+            .padding(.bottom, 6)
+
+            Button(action: newChat) {
+                Label("New chat", systemImage: "square.and.pencil")
                     .font(.subheadline.weight(.semibold))
-                    .padding(.horizontal, 4)
-                    .frame(minHeight: 34)
+                    .foregroundStyle(NethPalette.canvas)
+                    .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .background(NethPalette.accent, in: .rect(cornerRadius: 10))
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(.plain)
+            .disabled(busy)
+            .opacity(busy ? 0.55 : 1)
+            .keyboardShortcut("n", modifiers: .command)
+
+            Button { sheet = .search } label: {
+                Label("Search chats", systemImage: "magnifyingglass")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(NethPalette.muted)
+                    .frame(maxWidth: .infinity, minHeight: 38, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .background(NethPalette.inset, in: .rect(cornerRadius: 9))
+                    .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(NethPalette.border))
+            }
+            .buttonStyle(.plain)
+            .disabled(busy)
+            .keyboardShortcut("f", modifiers: .command)
+
+            if !chat.conversations.isEmpty {
+                Text("Recents")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(NethPalette.muted)
+                    .padding(.horizontal, 6)
+                    .padding(.top, 7)
+            }
+            ScrollView {
+                LazyVStack(spacing: 4) {
+                    ForEach(chat.conversations) { thread in
+                        threadRow(thread)
+                    }
+                }
+            }
+            .scrollIndicators(.hidden)
+
+            Rectangle().fill(NethPalette.border).frame(height: 1)
+            Button { sheet = .models } label: {
+                Label("Models & context", systemImage: "slider.horizontal.3")
+                    .foregroundStyle(NethPalette.muted)
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity, minHeight: 40, alignment: .leading)
+                    .padding(.horizontal, 6)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 10)
+        .padding(.horizontal, 15)
+        .padding(.vertical, 17)
+        .frame(maxHeight: .infinity)
+        .background(NethPalette.rail.ignoresSafeArea(edges: .vertical))
     }
 
-    private var emptyState: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "waveform")
-                .font(.system(size: 42, weight: .light))
-                .foregroundStyle(accent)
-                .frame(width: 86, height: 86)
-                .background(accent.opacity(0.11), in: RoundedRectangle(cornerRadius: 26))
-                .accessibilityHidden(true)
-            Text(models.current == nil ? "Choose a model" : "Start a chat")
-                .font(.system(.largeTitle, design: .rounded, weight: .bold))
-            if models.current == nil {
-                Text("Download Qwen3.5 4B or import a compatible GGUF.")
+    private func threadRow(_ thread: Conversation) -> some View {
+        let selected = thread.id == chat.conversationID
+        return Button { changeChat(thread.id) } label: {
+            HStack(spacing: 9) {
+                Image(systemName: "bubble.left").font(.caption)
+                    .foregroundStyle(selected ? NethPalette.accent : NethPalette.muted)
+                Text(verbatim: thread.title)
                     .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.white.opacity(selected ? 1 : 0.8))
+                    .lineLimit(1)
+                Spacer(minLength: 2)
+            }
+            .frame(minHeight: 39)
+            .padding(.horizontal, 8)
+            .contentShape(Rectangle())
+            .background(selected ? NethPalette.accent.opacity(0.13) : .clear, in: .rect(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+        .disabled(busy)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .contextMenu {
+            Button(role: .destructive) { deleting = thread } label: {
+                Label("Delete chat", systemImage: "trash")
+            }
+            .disabled(busy)
+        }
+    }
+
+    private func header(showNavigation: Bool) -> some View {
+        HStack(spacing: 11) {
+            if showNavigation {
+                iconControl("Chat history", symbol: "sidebar.left") { sheet = .history }
+                iconControl("Search chats", symbol: "magnifyingglass") { sheet = .search }
+                    .disabled(busy)
+                    .keyboardShortcut("f", modifiers: .command)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text(verbatim: chat.title)
+                    .font(.headline)
+                    .lineLimit(1)
+                    .foregroundStyle(.white)
+                Text(verbatim: models.current?.title ?? "Neth Local")
+                    .font(.caption)
+                    .foregroundStyle(NethPalette.muted)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 4)
+            if let runtime = chat.profile {
+                VStack(alignment: .trailing, spacing: 3) {
+                    if let rate = chat.tokensPerSecond, !chat.running {
+                        Text(String(format: "%.1f tok/s", rate))
+                            .font(.caption.weight(.semibold).monospacedDigit())
+                            .foregroundStyle(NethPalette.green)
+                    }
+                    Text(verbatim: runtime.detail)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(NethPalette.muted)
+                        .lineLimit(1)
+                }
+                .accessibilityElement(children: .combine)
+            }
+            iconControl("Models & context", symbol: "slider.horizontal.3") { sheet = .models }
+        }
+        .padding(.horizontal, showNavigation ? 13 : 24)
+        .frame(height: 63)
+    }
+
+    private func iconControl(_ title: String, symbol: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(NethPalette.accent)
+                .frame(width: 43, height: 43)
+                .background(NethPalette.surface, in: .rect(cornerRadius: 10))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+    }
+
+    private var startScreen: some View {
+        VStack(spacing: 15) {
+            Image(systemName: "waveform")
+                .font(.system(size: 42, weight: .regular))
+                .foregroundStyle(NethPalette.accent)
+                .frame(width: 91, height: 91)
+                .background(NethPalette.accent.opacity(0.12), in: .rect(cornerRadius: 27))
+                .overlay(RoundedRectangle(cornerRadius: 27).strokeBorder(NethPalette.accent.opacity(0.19)))
+                .accessibilityHidden(true)
+            Text(models.current == nil ? "Choose a model" : "Start a conversation")
+                .font(.system(.largeTitle, design: .rounded, weight: .semibold))
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.white)
+            if models.current == nil {
+                Text("Download Qwen3.5 4B or import a GGUF to chat on-device.")
+                    .font(.subheadline)
+                    .foregroundStyle(NethPalette.muted)
                     .multilineTextAlignment(.center)
-                Button("Open models") { showModels = true }
+                Button("Browse models") { sheet = .models }
                     .buttonStyle(.borderedProminent)
-                    .tint(accent)
-                    .foregroundStyle(.black)
+            } else {
+                Button {
+                    web = true
+                    typing = true
+                } label: {
+                    Label("Search the web", systemImage: "globe")
+                        .font(.subheadline.weight(.medium))
+                }
+                .buttonStyle(.bordered)
             }
         }
-        .padding(24)
+        .padding(22)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var transcript: some View {
         ScrollViewReader { reader in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 18) {
-                    ForEach(chat.messages) { message in messageBubble(message) }
-                    Color.clear.frame(height: 1).id("chatBottom")
+                LazyVStack(alignment: .leading, spacing: 24) {
+                    if chat.hasEarlier {
+                        Button {
+                            Task {
+                                if let previous = await chat.loadEarlier() { reader.scrollTo(previous, anchor: .top) }
+                            }
+                        } label: {
+                            Label("Load earlier messages", systemImage: "arrow.up")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.plain)
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(NethPalette.accent)
+                        .disabled(busy)
+                    }
+                    ForEach(chat.messages) { message in
+                        let active = message.id == -1 && chat.running
+                        ChatMessageRow(message: message, streaming: active, activity: active ? chat.activity : nil)
+                            .equatable()
+                            .id(message.id)
+                    }
+                    if chat.hasLater, let id = chat.conversationID {
+                        Button("Jump to latest") {
+                            nearBottom = true
+                            Task {
+                                await chat.open(id)
+                                reader.scrollTo("latest", anchor: .bottom)
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .frame(maxWidth: .infinity)
+                    }
+                    Color.clear.frame(height: 1).id("latest")
                 }
-                .padding(.horizontal, 22)
-                .padding(.top, 24)
-                .padding(.bottom, 12)
-                .frame(maxWidth: 840)
+                .padding(.horizontal, 19)
+                .padding(.vertical, 22)
+                .frame(maxWidth: 842)
                 .frame(maxWidth: .infinity)
             }
+            .onScrollGeometryChange(for: Bool.self) { geometry in
+                geometry.contentSize.height - geometry.visibleRect.maxY <= 170
+            } action: { _, close in nearBottom = close }
             .scrollDismissesKeyboard(.interactively)
             .defaultScrollAnchor(.bottom)
-            .onChange(of: chat.messages.last?.text) { _, _ in reader.scrollTo("chatBottom", anchor: .bottom) }
-        }
-    }
-
-    private func messageBubble(_ message: ChatMessage) -> some View {
-        let assistant = message.role == .assistant
-        return VStack(alignment: .leading, spacing: 8) {
-            Text(assistant ? "Neth Local" : "You")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(assistant ? accent : .secondary)
-            if let photo = message.photo, let preview = UIImage(contentsOfFile: photo.path) {
-                Image(uiImage: preview)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(maxWidth: 275, maxHeight: 192, alignment: .leading)
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
+            .onChange(of: chat.messages.last?.text) { _, _ in
+                if nearBottom && !chat.hasLater && chat.targetMessage == nil { reader.scrollTo("latest", anchor: .bottom) }
             }
-            if message.text.isEmpty && assistant {
-                ProgressView().controlSize(.small)
-            } else if assistant && message.text.hasPrefix("<think>") {
-                let parts = message.text.dropFirst(7).components(separatedBy: "</think>")
-                let thought = parts.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                if !thought.isEmpty {
-                    DisclosureGroup(parts.count > 1 ? "Thinking" : "Thinking…") {
-                        Text(thought).font(.subheadline).foregroundStyle(.secondary).textSelection(.enabled)
+            .onChange(of: chat.messages.last?.id) { _, _ in
+                if (nearBottom || chat.running) && !chat.hasLater && chat.targetMessage == nil {
+                    reader.scrollTo("latest", anchor: .bottom)
+                }
+            }
+            .task(id: chat.targetMessage) {
+                if let target = chat.targetMessage {
+                    await Task.yield()
+                    reader.scrollTo(target, anchor: .center)
+                }
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if !nearBottom && !chat.hasLater {
+                    iconControl("Scroll to latest", symbol: "arrow.down") {
+                        nearBottom = true
+                        reader.scrollTo("latest", anchor: .bottom)
                     }
-                    .font(.caption)
+                    .padding(12)
                 }
-                if parts.count > 1 {
-                    Text(parts.dropFirst().joined(separator: "</think>").trimmingCharacters(in: .whitespacesAndNewlines))
-                        .textSelection(.enabled)
-                }
-            } else if !message.text.isEmpty {
-                Text(message.text).textSelection(.enabled)
             }
         }
-        .padding(14)
-        .background(assistant ? panel : accent.opacity(0.13), in: RoundedRectangle(cornerRadius: 16))
-        .frame(maxWidth: .infinity, alignment: assistant ? .leading : .trailing)
     }
 
     private var composer: some View {
         VStack(alignment: .leading, spacing: 8) {
             if let photo, let preview = UIImage(contentsOfFile: photo.path) {
                 HStack {
-                    Image(uiImage: preview)
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: 40, height: 40)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                    Button("Remove photo", systemImage: "xmark.circle.fill") { clearPhoto() }
+                    Image(uiImage: preview).resizable().scaledToFill()
+                        .frame(width: 44, height: 44)
+                        .clipShape(.rect(cornerRadius: 7))
+                    Button("Remove photo", systemImage: "xmark.circle.fill") { clearAttachment() }
                         .labelStyle(.iconOnly)
                 }
-                .padding(.horizontal, 8)
+                .padding(.horizontal, 7)
             }
-            HStack(alignment: .bottom, spacing: 10) {
-                if supportsPhotos {
-                    PhotosPicker(selection: $photoItem, matching: .images) {
-                        Image(systemName: "photo").font(.system(size: 20))
-                            .frame(width: 38, height: 38)
-                    }
-                    .disabled(chat.running || photoLoading)
-                    .accessibilityLabel("Attach a photo")
+            TextField(models.current == nil ? "Choose a model to start" : "Message Neth Local",
+                      text: $draft, axis: .vertical)
+                .textFieldStyle(.plain)
+                .lineLimit(1...7)
+                .focused($typing)
+                .disabled(models.current == nil)
+                .padding(.horizontal, 9)
+                .padding(.top, 6)
+                .frame(minHeight: 34)
+            HStack(spacing: 8) {
+                Button {
+                    web.toggle()
+                } label: {
+                    Label("Web", systemImage: "globe")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(web ? NethPalette.green : NethPalette.muted)
+                        .padding(.horizontal, 10)
+                        .frame(minHeight: 39)
+                        .background(web ? NethPalette.green.opacity(0.13) : NethPalette.inset,
+                                    in: .rect(cornerRadius: 10))
+                        .overlay(RoundedRectangle(cornerRadius: 10)
+                            .strokeBorder(web ? NethPalette.green.opacity(0.33) : NethPalette.border))
                 }
-                TextField("Message", text: $draft, axis: .vertical)
-                    .lineLimit(1...6)
-                    .focused($composing)
-                    .frame(minHeight: 38)
-                    .disabled(models.current == nil)
-                    .padding(.horizontal, supportsPhotos ? 0 : 8)
-                if chat.running {
-                    Button { chat.stop() } label: {
-                        Image(systemName: "stop.fill").frame(width: 38, height: 38)
+                .buttonStyle(.plain)
+                .disabled(models.current == nil || busy)
+                .accessibilityLabel("Web search")
+                .accessibilityValue(web ? "Enabled for next message" : "Off")
+                .accessibilityHint("When enabled, the next message is sent as a search query.")
+                if canAttach {
+                    PhotosPicker(selection: $photoItem, matching: .images) {
+                        Image(systemName: "photo")
+                            .foregroundStyle(NethPalette.muted)
+                            .frame(width: 40, height: 39)
+                            .background(NethPalette.inset, in: .rect(cornerRadius: 10))
                     }
                     .buttonStyle(.plain)
-                    .background(Color.white.opacity(0.1), in: Circle())
-                    .accessibilityLabel("Stop generating")
+                    .accessibilityLabel("Attach photo")
+                    .disabled(busy || loadingPhoto)
+                }
+                Spacer(minLength: 4)
+                if web {
+                    Text("Search next message")
+                        .font(.caption)
+                        .foregroundStyle(NethPalette.muted)
+                        .lineLimit(1)
+                } else if let activity = chat.activity, chat.messages.last?.role != .assistant {
+                    Text(verbatim: activity).font(.caption).foregroundStyle(NethPalette.muted)
+                }
+                if chat.running {
+                    Button { chat.stop() } label: {
+                        Image(systemName: "stop.fill")
+                            .foregroundStyle(.white)
+                            .frame(width: 42, height: 42)
+                            .background(NethPalette.border, in: .rect(cornerRadius: 12))
+                    }
+                    .accessibilityLabel("Stop")
+                    .buttonStyle(.plain)
                 } else {
                     Button(action: send) {
                         Image(systemName: "arrow.up")
                             .font(.system(size: 17, weight: .bold))
-                            .frame(width: 38, height: 38)
-                            .foregroundStyle(readyToSend ? .black : .secondary)
-                            .background(readyToSend ? accent : Color.white.opacity(0.08), in: Circle())
+                            .foregroundStyle(canSend ? NethPalette.canvas : NethPalette.muted)
+                            .frame(width: 42, height: 42)
+                            .background(canSend ? NethPalette.accent : NethPalette.border, in: .rect(cornerRadius: 12))
                     }
+                    .disabled(!canSend)
+                    .accessibilityLabel("Send")
                     .buttonStyle(.plain)
-                    .disabled(!readyToSend)
-                    .accessibilityLabel("Send message")
                     .keyboardShortcut(.return, modifiers: .command)
                 }
             }
         }
-        .padding(8)
-        .background(panel, in: RoundedRectangle(cornerRadius: 22))
-        .overlay { RoundedRectangle(cornerRadius: 22).strokeBorder(.white.opacity(0.08)) }
-        .padding(.horizontal, 18)
-        .padding(.bottom, 12)
-        .frame(maxWidth: 840)
+        .padding(9)
+        .background(NethPalette.surface, in: .rect(cornerRadius: 17))
+        .overlay(RoundedRectangle(cornerRadius: 17)
+            .strokeBorder(typing ? NethPalette.accent.opacity(0.43) : NethPalette.border))
+        .frame(maxWidth: 810)
+        .padding(.horizontal, 17)
+        .padding(.bottom, 13)
     }
 
     private func send() {
-        guard readyToSend, let model = models.current else { return }
-        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        if text.utf8.count > 30_000 {
-            chat.problem = "Shorten this message or choose a larger context."
+        guard canSend, let model = models.current else { return }
+        let text = draft.replacingOccurrences(of: "\0", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.utf8.count > 64_000 {
+            chat.problem = "This message is too long for the available context."
             return
         }
-        let settings = EngineSettings(model: model, projector: supportsPhotos ? models.projector : nil,
+        guard !text.isEmpty || photo != nil else { return }
+        let settings = EngineSettings(model: model, projector: canAttach ? models.projector : nil,
                                       context: context, cpuOnly: cpuOnly, thinking: thinking)
-        chat.send(text.isEmpty ? "Describe this image." : text, photo: photo, settings: settings)
-        draft = ""
+        chat.send(text.isEmpty ? "Describe this image." : text, photo: photo,
+                  searchWeb: web && !text.isEmpty, settings: settings)
         photo = nil
         photoItem = nil
-        composing = false
+        web = false
+        draft = ""
+        typing = false
+        nearBottom = true
     }
 
-    private func clearPhoto() {
+    private func newChat() {
+        chat.newChat()
+        resetComposer()
+        sheet = nil
+        if models.current != nil { typing = true }
+    }
+
+    private func changeChat(_ id: String, at message: Int64? = nil) {
+        resetComposer()
+        sheet = nil
+        Task { await chat.open(id, at: message) }
+    }
+
+    private func resetComposer() {
+        draft = ""
+        web = false
+        nearBottom = true
+        clearAttachment()
+    }
+
+    private func clearAttachment() {
         if let photo { try? FileManager.default.removeItem(at: photo) }
         photo = nil
         photoItem = nil
     }
 
-    private func loadPhoto(_ item: PhotosPickerItem) {
-        photoLoading = true
+    private func preparePhoto(_ item: PhotosPickerItem) {
+        loadingPhoto = true
         Task {
-            defer { photoLoading = false }
+            defer { loadingPhoto = false }
             do {
                 guard let data = try await item.loadTransferable(type: Data.self) else {
                     throw LocalError(message: "Photos did not return an image.")
                 }
-                let thumbnail = try await Task.detached(priority: .utility) {
-                    try Self.smallPhoto(data)
-                }.value
-                guard supportsPhotos, photoItem == item else {
-                    try? FileManager.default.removeItem(at: thumbnail)
+                let path = try await Task.detached(priority: .utility) { try Self.thumbnail(data) }.value
+                guard canAttach, photoItem == item else {
+                    try? FileManager.default.removeItem(at: path)
                     return
                 }
                 if let photo { try? FileManager.default.removeItem(at: photo) }
-                photo = thumbnail
-            } catch {
-                chat.problem = error.localizedDescription
-            }
+                photo = path
+            } catch { chat.problem = error.localizedDescription }
         }
     }
 
-    private nonisolated static func smallPhoto(_ data: Data) throws -> URL {
-        let error = LocalError(message: "The app could not prepare this photo.")
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { throw error }
+    private nonisolated static func thumbnail(_ data: Data) throws -> URL {
+        let issue = LocalError(message: "Couldn't prepare this photo.")
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { throw issue }
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceThumbnailMaxPixelSize: 448
         ]
-        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { throw error }
-        let url = URL.temporaryDirectory.appending(path: "\(UUID().uuidString).jpg")
-        guard let out = CGImageDestinationCreateWithURL(url as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else {
-            throw error
-        }
-        CGImageDestinationAddImage(out, image, nil)
-        guard CGImageDestinationFinalize(out) else { throw error }
-        return url
+        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { throw issue }
+        let path = URL.temporaryDirectory.appending(path: "\(UUID().uuidString).jpg")
+        guard let destination = CGImageDestinationCreateWithURL(path as CFURL, UTType.jpeg.identifier as CFString, 1, nil)
+        else { throw issue }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else { throw issue }
+        return path
     }
 }
 
 @MainActor
-private struct ModelPanel: View {
-    @ObservedObject var models: LocalModels
-    @Binding var context: Int
-    @Binding var cpuOnly: Bool
-    @Binding var thinking: Bool
-    let inferenceBusy: Bool
-    let unload: () -> Void
+private struct ChatSearchPanel: View {
+    let search: (String) async throws -> [TranscriptMatch]
+    let open: (TranscriptMatch) -> Void
     @Environment(\.dismiss) private var dismiss
-    @State private var showImporter = false
-    @State private var removal: URL?
-    @State private var available = Int64(nl_available_memory())
+    @State private var query = ""
+    @State private var matches: [TranscriptMatch] = []
+    @State private var searched = false
+    @State private var issue: String?
 
     var body: some View {
         NavigationStack {
-            List {
-                Section {
-                    assetRow(.qwen, detail: "HauhauCS · Q4_K_M · \(LocalModels.size(ModelAsset.qwen.bytes))")
-                    assetRow(.vision, detail: "Photos · \(LocalModels.size(ModelAsset.vision.bytes))")
-                    Link("Model details", destination: ModelAsset.modelCard)
-                        .font(.footnote)
-                } header: { Text("Qwen3.5") }
-
-                Section {
-                    ForEach(models.installed) { model in
-                        Button {
-                            models.selectedID = model.id
-                        } label: {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(model.title).foregroundStyle(.primary)
-                                    Text(LocalModels.size(model.bytes)).font(.caption).foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                if models.selectedID == model.id {
-                                    Image(systemName: "checkmark.circle.fill").foregroundStyle(accent)
-                                }
-                            }
-                        }
-                        .disabled(inferenceBusy)
-                        .swipeActions {
-                            Button("Remove", role: .destructive) { removal = model.url }.disabled(inferenceBusy)
-                        }
+            List(matches) { hit in
+                Button { open(hit) } label: {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(verbatim: hit.title).font(.subheadline.weight(.semibold)).foregroundStyle(.white)
+                            .lineLimit(1)
+                        Text(verbatim: hit.excerpt).font(.footnote).foregroundStyle(NethPalette.muted)
+                            .lineLimit(3)
                     }
-                    Button {
-                        showImporter = true
-                    } label: {
-                        Label(models.importing ? "Importing…" : "Import GGUF", systemImage: "folder")
-                    }
-                    .disabled(models.importing || inferenceBusy)
-                } header: { Text("On this iPad") }
-
-                Section {
-                    Picker("Context", selection: $context) {
-                        Text("512 tokens").tag(512)
-                        Text("1,024 tokens").tag(1024)
-                        Text("2,048 tokens").tag(2048)
-                    }
-                    Toggle("Thinking mode", isOn: $thinking)
-                    Toggle("CPU only", isOn: $cpuOnly)
-                } header: { Text("Inference") } footer: {
-                    if available > 0 {
-                        Text("iPadOS reports \(LocalModels.size(available)) of additional memory available to this app.")
-                    }
+                    .padding(.vertical, 4)
                 }
-                .disabled(inferenceBusy)
             }
-            .navigationTitle("Models")
+            .scrollContentBackground(.hidden)
+            .background(NethPalette.canvas)
+            .overlay {
+                if let issue {
+                    ContentUnavailableView("Search unavailable", systemImage: "exclamationmark.magnifyingglass",
+                                           description: Text(issue))
+                } else if searched && matches.isEmpty {
+                    ContentUnavailableView("No matches", systemImage: "magnifyingglass")
+                }
+            }
+            .navigationTitle("Search chats")
             .navigationBarTitleDisplayMode(.inline)
+            .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Words in your chats")
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
         }
-        .fileImporter(isPresented: $showImporter, allowedContentTypes: [.data]) { result in
-            switch result {
-            case .success(let url): models.importGGUF(url)
-            case .failure(let error): models.problem = error.localizedDescription
-            }
+        .task(id: query) {
+            searched = false
+            issue = nil
+            let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.isEmpty { matches = []; return }
+            do {
+                try await Task.sleep(for: .milliseconds(160))
+                let found = try await search(text)
+                try Task.checkCancellation()
+                matches = found
+                searched = true
+            } catch is CancellationError {
+            } catch { issue = error.localizedDescription }
         }
-        .confirmationDialog("Remove this model file?", isPresented: Binding(
-            get: { removal != nil }, set: { if !$0 { removal = nil } }), titleVisibility: .visible) {
-            Button("Remove download", role: .destructive) {
-                if let removal {
-                    unload()
-                    models.remove(removal)
-                }
-                removal = nil
-            }
-        }
-        .alert("Models", isPresented: Binding(get: { models.problem != nil }, set: { if !$0 { models.problem = nil } })) {
-            Button("OK", role: .cancel) { models.problem = nil }
-        } message: {
-            Text(models.problem ?? "")
-        }
-    }
-
-    private func assetRow(_ asset: ModelAsset, detail: String) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(asset.title).font(.body.weight(.medium))
-                    Text(detail).font(.caption).foregroundStyle(.secondary)
-                }
-                Spacer()
-                if models.has(asset) {
-                    if asset == .vision, let projector = models.projector {
-                        Button("Remove", systemImage: "trash") { removal = projector }
-                            .labelStyle(.iconOnly)
-                            .disabled(inferenceBusy)
-                    } else {
-                        Image(systemName: "checkmark.circle.fill").foregroundStyle(accent)
-                            .accessibilityLabel("Downloaded")
-                    }
-                } else if models.activeDownload == asset {
-                    if !models.verifying {
-                        Button("Cancel") { models.cancelDownload() }
-                    }
-                } else {
-                    Button("Download") { models.download(asset) }
-                        .buttonStyle(.bordered)
-                        .disabled(models.activeDownload != nil)
-                }
-            }
-            if models.activeDownload == asset {
-                if models.verifying {
-                    ProgressView("Checking file")
-                } else {
-                    ProgressView(value: models.fraction) {
-                        Text(models.fraction.formatted(.percent.precision(.fractionLength(0))))
-                            .font(.caption.monospacedDigit())
-                    }
-                }
-            }
-        }
-        .padding(.vertical, 3)
     }
 }

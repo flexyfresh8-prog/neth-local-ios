@@ -35,6 +35,7 @@ struct NLRuntime {
     std::string projector;
     bool qwen = false;
     bool metal = false;
+    bool compact_kv = false;
 
     ~NLRuntime() {
         if (vision) mtmd_free(vision);
@@ -102,7 +103,6 @@ NLRuntime *nl_open(const char *model_path, int32_t context, bool metal,
     runtime->qwen = std::strcmp(arch, "qwen35") == 0 || std::strcmp(arch, "qwen35moe") == 0;
     runtime->metal = metal;
     auto params = llama_context_default_params();
-    params.n_ctx = context;
     params.n_batch = 128;
     params.n_ubatch = 128;
     params.n_outputs_max = 1;
@@ -110,7 +110,32 @@ NLRuntime *nl_open(const char *model_path, int32_t context, bool metal,
     params.n_threads_batch = threads();
     params.offload_kqv = metal;
     params.op_offload = metal;
-    runtime->context = llama_init_from_model(runtime->model, params);
+    const auto available = nl_available_memory();
+    constexpr size_t working_reserve = 268435456;
+    // The Qwen3.5 4B checkpoint uses 32 KiB/token in F16 across its attention layers.
+    const auto is_qwen_4b = runtime->qwen && llama_model_n_params(runtime->model) < 5'000'000'000ULL;
+    const size_t full_cache_per_token = is_qwen_4b ? 32768 : 131072;
+    for (int32_t window = context; !stopped(cancel); window /= 2) {
+        const bool compact = is_qwen_4b && window >= 4096;
+        params.n_ctx = window;
+        if (compact && (!available || available > working_reserve + size_t(window) * 18432)) {
+            auto small_cache = params;
+            small_cache.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            small_cache.type_k = GGML_TYPE_Q8_0;
+            small_cache.type_v = GGML_TYPE_Q8_0;
+            runtime->context = llama_init_from_model(runtime->model, small_cache);
+            if (runtime->context) {
+                runtime->compact_kv = true;
+                break;
+            }
+        }
+        if (window <= 1024 || !available || available > working_reserve + size_t(window) * full_cache_per_token) {
+            runtime->context = llama_init_from_model(runtime->model, params);
+            if (runtime->context) break;
+        }
+        if (window <= 1024) break;
+    }
+    if (stopped(cancel)) return nullptr;
     if (!runtime->context) {
         report(error, error_size, "The engine could not allocate the context. Try a smaller context or CPU mode.");
         return nullptr;
@@ -119,10 +144,17 @@ NLRuntime *nl_open(const char *model_path, int32_t context, bool metal,
 }
 
 void nl_close(NLRuntime *runtime) { delete runtime; }
+int32_t nl_context_window(const NLRuntime *runtime) { return llama_n_ctx_seq(runtime->context); }
+bool nl_context_compact(const NLRuntime *runtime) { return runtime->compact_kv; }
 
 static std::string qwen_prompt(const NLMessage *messages, size_t first, size_t count,
-                               size_t picture, bool thinking) {
+                               size_t picture, const char *reference, bool thinking) {
     std::string prompt;
+    if (reference && *reference) {
+        prompt = "<|im_start|>system\n";
+        prompt += reference;
+        prompt += "<|im_end|>\n";
+    }
     for (size_t i = first; i < count; ++i) {
         std::string text = messages[i].text;
         prompt += "<|im_start|>";
@@ -135,6 +167,7 @@ static std::string qwen_prompt(const NLMessage *messages, size_t first, size_t c
         if (std::strcmp(messages[i].role, "assistant") == 0) {
             const auto end = text.find("</think>");
             if (end != std::string::npos) text.erase(0, end + std::strlen("</think>"));
+            else if (text.rfind("<think>", 0) == 0) text.clear();
             const auto answer = text.find_first_not_of("\n");
             text = answer == std::string::npos ? "" : text.substr(answer);
         }
@@ -147,9 +180,17 @@ static std::string qwen_prompt(const NLMessage *messages, size_t first, size_t c
 }
 
 static std::string model_prompt(const NLRuntime &runtime, const NLMessage *messages,
-                                size_t first, size_t count) {
+                                size_t first, size_t count, const char *reference) {
     std::vector<llama_chat_message> chat;
     for (size_t i = first; i < count; ++i) chat.push_back({messages[i].role, messages[i].text});
+    // Some imported chat templates do not accept a separate system role.
+    std::string question;
+    if (reference && *reference) {
+        question = reference;
+        question += "\n\nUser message:\n";
+        question += chat.back().content;
+        chat.back().content = question.c_str();
+    }
     const char *format = llama_model_chat_template(runtime.model, nullptr);
     if (!format) format = "chatml";
     int32_t size = llama_chat_apply_template(format, chat.data(), chat.size(), true, nullptr, 0);
@@ -191,7 +232,7 @@ static void emit_text(std::string &pending, NLChunk chunk, void *user, bool fina
 }
 
 int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
-                    const char *projector_path, bool thinking, int32_t output_limit,
+                    const char *projector_path, const char *reference, bool thinking, int32_t output_limit,
                     NLCancel *cancel, NLChunk chunk, void *user, int32_t *generated,
                     char *error, size_t error_size) {
     *generated = 0;
@@ -268,8 +309,8 @@ int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
     for (;;) {
         if (stopped(cancel)) return NL_STOPPED;
         const auto active_picture = picture != no_picture && picture >= first ? picture : no_picture;
-        auto prompt = runtime->qwen ? qwen_prompt(messages, first, count, active_picture, thinking)
-                                    : model_prompt(*runtime, messages, first, count);
+        auto prompt = runtime->qwen ? qwen_prompt(messages, first, count, active_picture, reference, thinking)
+                                    : model_prompt(*runtime, messages, first, count, reference);
         if (prompt.empty()) {
             report(error, error_size, "The engine does not recognize this model’s chat template.");
             return NL_ERROR;

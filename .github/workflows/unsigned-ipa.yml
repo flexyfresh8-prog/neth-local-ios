@@ -1,4 +1,4 @@
-name: Build unsigned iPad IPA
+name: Build iPad IPAs
 
 on:
   workflow_dispatch:
@@ -16,13 +16,20 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - name: Build and inspect the unsigned iPad app
+      - name: Check chat storage, search and reply formatting
+        run: |
+          xcrun --sdk macosx swiftc -swift-version 5 -parse-as-library \
+            App/ChatArchive.swift App/WebSearch.swift App/ReplyFormat.swift scripts/check-chat.swift \
+            -lsqlite3 -o "$RUNNER_TEMP/check-chat"
+          "$RUNNER_TEMP/check-chat"
+      - name: Build and verify iPad packages
         run: bash scripts/build-ipa.sh
       - uses: actions/upload-artifact@v6
         with:
-          name: NethLocal-iPad-unsigned
+          name: NethLocal-iPad
           path: |
             out/NethLocal-unsigned.ipa
+            out/NethLocal-Impactor.ipa
             out/NethLocal.entitlements
           if-no-files-found: error
           compression-level: 0

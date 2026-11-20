@@ -2,11 +2,6 @@ import CryptoKit
 import Foundation
 import SwiftUI
 
-struct LocalError: LocalizedError {
-    let message: String
-    var errorDescription: String? { message }
-}
-
 enum ModelAsset: String, CaseIterable {
     case qwen, vision
 
