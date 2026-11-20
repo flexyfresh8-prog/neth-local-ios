@@ -9,8 +9,8 @@
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
     <key>CFBundleName</key><string>NethLocal</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>3.2</string>
-    <key>CFBundleVersion</key><string>5</string>
+    <key>CFBundleShortVersionString</key><string>3.3</string>
+    <key>CFBundleVersion</key><string>6</string>
     <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
     <key>MinimumOSVersion</key><string>18.0</string>
     <key>LSRequiresIPhoneOS</key><true/>

@@ -55,6 +55,7 @@ private struct ChatScreen: View {
     @State private var exportName = "Reply.md"
 
     private let readingWidth: CGFloat = 756
+    private let composerWidth: CGFloat = 680
 
     private var canAttach: Bool { models.current?.isPreset == true && models.projector != nil }
     private var busy: Bool { chat.running || chat.opening }
@@ -65,33 +66,26 @@ private struct ChatScreen: View {
 
     var body: some View {
         GeometryReader { geometry in
-            let wide = geometry.size.width >= 840 && !typeSize.isAccessibilitySize
-            let railVisible = wide && showSidebar
+            let wide = geometry.size.width >= 850 && !typeSize.isAccessibilitySize
+            let panelVisible = wide && showSidebar
             HStack(spacing: 0) {
-                if railVisible {
+                if wide { activityRail(panelVisible: panelVisible) }
+                if panelVisible {
                     sidebar(inSheet: false)
-                        .frame(width: 226)
-                        .overlay(alignment: .trailing) { Rectangle().fill(NethPalette.border.opacity(0.7)).frame(width: 1) }
+                        .frame(width: 204)
+                        .overlay(alignment: .trailing) { Rectangle().fill(NethPalette.border).frame(width: 1) }
                         .transition(.move(edge: .leading).combined(with: .opacity))
                 }
                 VStack(spacing: 0) {
-                    header(wide: wide, railVisible: railVisible)
-                    Rectangle().fill(NethPalette.border.opacity(0.65)).frame(height: 1)
-                    ZStack {
-                        if chat.messages.isEmpty {
-                            startScreen.transition(.opacity)
-                        } else {
-                            transcript.transition(.opacity)
-                        }
-                    }
-                    .animation(reduceMotion ? nil : NethMotion.fade, value: chat.messages.isEmpty)
-                    composer
+                    header(wide: wide)
+                    Rectangle().fill(NethPalette.border).frame(height: 1)
+                    workspace
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(NethPalette.canvas)
                 .zIndex(1)
             }
-            .animation(reduceMotion ? nil : NethMotion.reveal, value: railVisible)
+            .animation(reduceMotion ? nil : NethMotion.reveal, value: panelVisible)
         }
         .foregroundStyle(NethPalette.text)
         .background(NethPalette.canvas.ignoresSafeArea())
@@ -164,11 +158,55 @@ private struct ChatScreen: View {
         }
     }
 
+    private func activityRail(panelVisible: Bool) -> some View {
+        VStack(spacing: 5) {
+            NethMascotMark()
+                .frame(width: 44, height: 41)
+            railButton(panelVisible ? "Hide chats" : "Show chats", symbol: "sidebar.left", selected: panelVisible) {
+                showSidebar.toggle()
+            }
+            .keyboardShortcut("b", modifiers: .command)
+            railButton("New chat", symbol: "plus", action: newChat)
+                .disabled(busy)
+                .keyboardShortcut("n", modifiers: .command)
+            railButton("Search chats", symbol: "magnifyingglass") { sheet = .search }
+                .disabled(busy)
+                .keyboardShortcut("f", modifiers: .command)
+            railButton("Quattro tools", symbol: "square.grid.2x2") { sheet = .tools }
+                .disabled(busy)
+            Spacer(minLength: 0)
+            railButton("Models & context", symbol: "slider.horizontal.3") { sheet = .models }
+        }
+        .padding(.vertical, 6)
+        .frame(width: 56)
+        .frame(maxHeight: .infinity)
+        .background(NethPalette.inset.ignoresSafeArea(edges: .vertical))
+        .overlay(alignment: .trailing) { Rectangle().fill(NethPalette.border).frame(width: 1) }
+        .zIndex(2)
+    }
+
+    private func railButton(_ title: String, symbol: String, selected: Bool = false,
+                            action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 17, weight: .medium))
+                .foregroundStyle(selected ? NethPalette.text : NethPalette.muted)
+                .frame(width: 44, height: 44)
+                .background(selected ? NethPalette.selected : .clear, in: .rect(cornerRadius: 8))
+                .contentShape(Rectangle())
+                .animation(reduceMotion ? nil : NethMotion.fade, value: selected)
+        }
+        .buttonStyle(NethPress())
+        .accessibilityLabel(title)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
     private func sidebar(inSheet: Bool) -> some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 9) {
-                NethMascotMark()
-                Text("Neth Local").font(.headline).accessibilityAddTraits(.isHeader)
+                Text(inSheet ? "Chats" : "Neth Local")
+                    .font(.subheadline.weight(.semibold))
+                    .accessibilityAddTraits(.isHeader)
                 Spacer()
                 if inSheet {
                     Button("Done") { sheet = nil }
@@ -177,17 +215,24 @@ private struct ChatScreen: View {
                 }
             }
             .padding(.horizontal, 9)
-            .frame(minHeight: 34)
+            .frame(minHeight: 32)
 
-            VStack(spacing: 3) {
-                sidebarAction("New chat", symbol: "plus", prominent: true, action: newChat)
-                    .keyboardShortcut("n", modifiers: .command)
-                sidebarAction("Search chats", symbol: "magnifyingglass") { sheet = .search }
-                    .keyboardShortcut("f", modifiers: .command)
-                sidebarAction("Quattro tools", symbol: "square.grid.2x2") { sheet = .tools }
+            if inSheet {
+                VStack(spacing: 3) {
+                    sidebarAction("New chat", symbol: "plus", prominent: true, action: newChat)
+                        .keyboardShortcut("n", modifiers: .command)
+                    sidebarAction("Search chats", symbol: "magnifyingglass") { sheet = .search }
+                        .keyboardShortcut("f", modifiers: .command)
+                    sidebarAction("Quattro tools", symbol: "square.grid.2x2") { sheet = .tools }
+                }
             }
 
-            if !chat.conversations.isEmpty {
+            if chat.conversations.isEmpty {
+                Text("No chats yet")
+                    .font(.caption)
+                    .foregroundStyle(NethPalette.muted)
+                    .padding(.horizontal, 9)
+            } else {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Recent chats")
                         .font(.caption.weight(.medium))
@@ -204,7 +249,7 @@ private struct ChatScreen: View {
             }
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 18)
+        .padding(.vertical, 11)
         .frame(maxHeight: .infinity, alignment: .top)
         .background(NethPalette.rail.ignoresSafeArea(edges: .vertical))
     }
@@ -231,6 +276,10 @@ private struct ChatScreen: View {
         let selected = thread.id == chat.conversationID
         return Button { changeChat(thread.id) } label: {
             HStack(spacing: 8) {
+                Image(systemName: "bubble.left")
+                    .font(.caption)
+                    .foregroundStyle(NethPalette.muted)
+                    .accessibilityHidden(true)
                 Text(verbatim: thread.title)
                     .font(.subheadline)
                     .foregroundStyle(selected ? NethPalette.text : NethPalette.muted)
@@ -243,7 +292,7 @@ private struct ChatScreen: View {
             }
             .padding(.horizontal, 10)
             .frame(minHeight: 44)
-            .background(selected ? NethPalette.selected : .clear, in: .rect(cornerRadius: 9))
+            .background(selected ? NethPalette.selected : .clear, in: .rect(cornerRadius: 7))
             .contentShape(Rectangle())
             .animation(reduceMotion ? nil : NethMotion.fade, value: selected)
         }
@@ -258,50 +307,53 @@ private struct ChatScreen: View {
         }
     }
 
-    private func header(wide: Bool, railVisible: Bool) -> some View {
-        HStack(spacing: 7) {
-            iconControl(railVisible ? "Hide chat sidebar" : "Show chat sidebar", symbol: "sidebar.left") {
-                if wide { showSidebar.toggle() } else { sheet = .history }
-            }
-            VStack(alignment: .leading, spacing: 3) {
-                Text(verbatim: chat.title)
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(1)
-                    .accessibilityAddTraits(.isHeader)
-                if !wide, let runtimeDetail {
-                    runtimeLabel(runtimeDetail)
-                } else if let model = models.current {
-                    Text(verbatim: model.isPreset ? "Qwen3.5 4B" : model.title)
-                        .font(.caption)
-                        .foregroundStyle(NethPalette.muted)
-                        .lineLimit(1)
+    @ViewBuilder
+    private func header(wide: Bool) -> some View {
+        if wide {
+            HStack(spacing: 15) {
+                HStack(spacing: 8) {
+                    Image(systemName: "bubble.left").foregroundStyle(NethPalette.muted).accessibilityHidden(true)
+                    chatTitle
+                }
+                .font(.caption)
+                .padding(.horizontal, 14)
+                .frame(minHeight: 48)
+                .background(NethPalette.canvas)
+                .overlay(alignment: .top) { Rectangle().fill(NethPalette.muted).frame(height: 1) }
+                .overlay(alignment: .trailing) { Rectangle().fill(NethPalette.border).frame(width: 1) }
+                Spacer(minLength: 4)
+                if let runtimeDetail {
+                    runtimeLabel(runtimeDetail).padding(.trailing, 15)
                 }
             }
-            Spacer(minLength: 4)
-            if wide, let runtimeDetail { runtimeLabel(runtimeDetail) }
-            if !railVisible {
+            .background(NethPalette.rail)
+        } else {
+            HStack(spacing: 4) {
+                iconControl("Show chats", symbol: "sidebar.left") { sheet = .history }
+                VStack(alignment: .leading, spacing: 3) {
+                    chatTitle
+                    if let runtimeDetail { runtimeLabel(runtimeDetail) }
+                }
+                Spacer(minLength: 4)
                 iconControl("Search chats", symbol: "magnifyingglass") { sheet = .search }
                     .disabled(busy)
                     .keyboardShortcut("f", modifiers: .command)
-                iconControl("New chat", symbol: "square.and.pencil", action: newChat)
+                iconControl("New chat", symbol: "plus", action: newChat)
                     .disabled(busy)
                     .keyboardShortcut("n", modifiers: .command)
+                iconControl("Models & context", symbol: "slider.horizontal.3") { sheet = .models }
             }
-            Button { sheet = .models } label: {
-                HStack(spacing: 7) {
-                    Image(systemName: "slider.horizontal.3").font(.system(size: 15, weight: .medium))
-                    if wide { Text("Models").font(.subheadline.weight(.medium)) }
-                }
-                .padding(.horizontal, wide ? 13 : 0)
-                .frame(minWidth: 44, minHeight: 44)
-                .background(NethPalette.surface, in: .rect(cornerRadius: 11))
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(NethPress())
-            .accessibilityLabel("Models & context")
+            .padding(.horizontal, 6)
+            .padding(.vertical, 4)
+            .background(NethPalette.rail)
         }
-        .padding(.horizontal, wide ? 20 : 8)
-        .padding(.vertical, 8)
+    }
+
+    private var chatTitle: some View {
+        Text(verbatim: chat.title)
+            .font(.subheadline.weight(.semibold))
+            .lineLimit(1)
+            .accessibilityAddTraits(.isHeader)
     }
 
     private var runtimeDetail: String? {
@@ -329,71 +381,83 @@ private struct ChatScreen: View {
         .accessibilityLabel(title)
     }
 
-    private var startScreen: some View {
-        ScrollView {
-            VStack(spacing: 13) {
-                NethMascot()
-                    .padding(.bottom, 11)
-                Text(models.current == nil ? "Choose a model" : "What shall we work on?")
-                    .font(.system(.largeTitle, design: .serif, weight: .regular))
-                    .multilineTextAlignment(.center)
-                    .accessibilityAddTraits(.isHeader)
-                if models.current == nil {
-                    Text("Download Qwen3.5 4B or import a GGUF to chat on-device.")
-                        .font(.subheadline)
-                        .foregroundStyle(NethPalette.muted)
-                        .multilineTextAlignment(.center)
-                    Button { sheet = .models } label: {
-                        Label("Browse models", systemImage: "arrow.right")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(NethPalette.canvas)
-                            .padding(.horizontal, 15)
-                            .frame(minHeight: 44)
-                            .background(NethPalette.text, in: .capsule)
-                    }
-                    .buttonStyle(NethPress())
-                    .padding(.top, 6)
+    private var workspace: some View {
+        let atStart = chat.messages.isEmpty && !chat.running
+        return GeometryReader { layout in
+            let height = layout.size.height
+            let oneRow = layout.size.width >= 535 && !typeSize.isAccessibilitySize
+            let showWelcome = atStart && !typing && draft.isEmpty && photo == nil
+            let showScene = showWelcome && height >= 415 && !typeSize.isAccessibilitySize
+            let showShortcuts = showWelcome && height >= (oneRow ? 340 : 470)
+
+            VStack(spacing: 0) {
+                if atStart {
+                    Spacer(minLength: 0)
                 } else {
-                    ViewThatFits(in: .horizontal) {
-                        HStack(spacing: 8) { quickActions }
-                        VStack(spacing: 8) { quickActions }
-                    }
-                    .padding(.top, 8)
+                    transcript.transition(.opacity)
                 }
+                VStack(alignment: .leading, spacing: 9) {
+                    if showScene { WorkspaceScene().transition(.opacity) }
+                    composer(maxLines: height < 360 ? 3 : 7)
+                    if showShortcuts {
+                        if oneRow {
+                            HStack(spacing: 8) { quickActions }
+                        } else {
+                            VStack(spacing: 6) { quickActions }
+                        }
+                    }
+                }
+                .frame(maxWidth: composerWidth)
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+                .padding(.bottom, atStart ? 8 : 13)
+                .layoutPriority(1)
+                if atStart { Spacer(minLength: 0) }
             }
-            .padding(24)
-            .frame(maxWidth: readingWidth)
-            .frame(maxWidth: .infinity)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background {
+                if atStart { WorkspaceBackdrop().transition(.opacity) }
+            }
+            .animation(reduceMotion ? nil : NethMotion.reveal, value: atStart)
+            .animation(reduceMotion ? nil : NethMotion.fade, value: showScene)
         }
-        .defaultScrollAnchor(.center, for: .alignment)
-        .scrollBounceBehavior(.basedOnSize)
     }
 
     @ViewBuilder
     private var quickActions: some View {
-        quickAction("Create files", symbol: "doc.badge.plus") {
+        quickAction("Draft a note", symbol: "doc.badge.plus", available: models.current != nil) {
             quattro = true
             makeFiles = true
+            if draft.isEmpty { draft = "/file Notes.md " }
             typing = true
         }
-        quickAction("Search the web", symbol: "globe") {
+        quickAction("Research a topic", symbol: "globe") {
             web = true
+            makeFiles = false
+            if models.current == nil { quattro = true }
+            if draft.isEmpty { draft = "Find reliable sources about " }
             typing = true
         }
+        quickAction("Browse tools", symbol: "square.grid.2x2") { sheet = .tools }
     }
 
-    private func quickAction(_ title: String, symbol: String, action: @escaping () -> Void) -> some View {
+    private func quickAction(_ title: String, symbol: String, available: Bool = true,
+                             action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Label(title, systemImage: symbol)
-                .font(.subheadline)
-                .foregroundStyle(NethPalette.muted)
-                .padding(.horizontal, 13)
-                .frame(minHeight: 44)
-                .background(NethPalette.rail, in: .capsule)
-                .overlay(Capsule().strokeBorder(NethPalette.border).allowsHitTesting(false))
+            HStack(spacing: 8) {
+                Image(systemName: symbol).foregroundStyle(NethPalette.muted).accessibilityHidden(true)
+                Text(title).foregroundStyle(NethPalette.text)
+                Spacer(minLength: 2)
+            }
+            .font(.caption.weight(.medium))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, minHeight: 47, alignment: .leading)
+            .background(NethPalette.rail, in: .rect(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(NethPalette.border).allowsHitTesting(false))
         }
         .buttonStyle(NethPress())
-        .disabled(busy)
+        .disabled(busy || !available)
     }
 
     private var transcript: some View {
@@ -483,12 +547,23 @@ private struct ChatScreen: View {
         }
     }
 
-    private var composer: some View {
-        VStack(alignment: .leading, spacing: 10) {
+    private func composer(maxLines: Int) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
             if chat.running {
                 EffortMeter(activity: chat.activity ?? "Preparing…", step: chat.effortStep, total: chat.effortTotal)
                     .padding(.horizontal, 3)
                     .transition(.offset(y: 4).combined(with: .opacity))
+            }
+            if typeSize.isAccessibilitySize {
+                VStack(spacing: 6) {
+                    modelSelector
+                    effortMenu
+                }
+            } else {
+                HStack(spacing: 8) {
+                    modelSelector
+                    effortMenu.frame(maxWidth: 150)
+                }
             }
             VStack(alignment: .leading, spacing: 6) {
                 if let photo, let preview = UIImage(contentsOfFile: photo.path) {
@@ -502,22 +577,21 @@ private struct ChatScreen: View {
                     .padding(.horizontal, 7)
                     .transition(.opacity)
                 }
-                TextField(models.current == nil && !quattro ? "Choose a model to start" : quattro ? "Message Quattro" : "Message Neth Local",
+                TextField(models.current == nil && !quattro ? "Choose a model to start" : quattro ? "Give Quattro a task" : "Describe a task or ask a question",
                           text: $draft, axis: .vertical)
                     .font(.body)
                     .textFieldStyle(.plain)
-                    .lineLimit(1...7)
+                    .lineLimit(1...maxLines)
                     .focused($typing)
                     .disabled(models.current == nil && !quattro)
                     .padding(.horizontal, 8)
-                    .padding(.top, 4)
-                    .frame(minHeight: 39)
+                    .padding(.top, 7)
+                    .frame(minHeight: maxLines <= 3 ? 36 : 51, alignment: .topLeading)
                 ViewThatFits(in: .horizontal) {
                     HStack(spacing: 4) {
                         attachControl
                         modeButtons
                         Spacer(minLength: 6)
-                        effortMenu
                         sendControl
                     }
                     VStack(alignment: .leading, spacing: 4) {
@@ -529,25 +603,20 @@ private struct ChatScreen: View {
                         HStack(spacing: 4) {
                             attachControl
                             Spacer(minLength: 1)
-                            effortMenu
                             sendControl
                         }
                     }
                 }
             }
             .padding(9)
-            .background(NethPalette.surface, in: .rect(cornerRadius: 20))
-            .overlay(RoundedRectangle(cornerRadius: 20)
+            .background(NethPalette.surface, in: .rect(cornerRadius: 11))
+            .overlay(RoundedRectangle(cornerRadius: 11)
                 .strokeBorder(typing ? NethPalette.muted.opacity(0.75) : NethPalette.border)
                 .allowsHitTesting(false))
             .animation(reduceMotion ? nil : NethMotion.fade, value: typing)
             .animation(reduceMotion ? nil : NethMotion.fade, value: photo != nil)
         }
         .animation(reduceMotion ? nil : NethMotion.reveal, value: chat.running)
-        .frame(maxWidth: readingWidth)
-        .padding(.horizontal, 16)
-        .padding(.top, 8)
-        .padding(.bottom, 14)
     }
 
     @ViewBuilder
@@ -579,7 +648,7 @@ private struct ChatScreen: View {
             .foregroundStyle(active ? NethPalette.text : NethPalette.muted)
             .padding(.horizontal, 8)
             .padding(.vertical, 7)
-            .background(active ? NethPalette.selected : .clear, in: .capsule)
+            .background(active ? NethPalette.selected : .clear, in: .rect(cornerRadius: 7))
             .frame(minHeight: 44)
             .contentShape(Rectangle())
             .fixedSize(horizontal: true, vertical: false)
@@ -617,6 +686,42 @@ private struct ChatScreen: View {
         .disabled(busy || loadingPhoto)
     }
 
+    @ViewBuilder
+    private var modelSelector: some View {
+        if models.installed.isEmpty {
+            Button { sheet = .models } label: {
+                selectorLabel("Choose a model", symbol: "cpu", trailing: "arrow.up.right")
+            }
+            .buttonStyle(NethPress())
+        } else {
+            let title = models.current.map(modelName) ?? "Choose a model"
+            Menu {
+                ForEach(models.installed) { model in
+                    Button { models.selectedID = model.id } label: {
+                        if models.selectedID == model.id {
+                            Label(modelName(model), systemImage: "checkmark")
+                        } else {
+                            Text(modelName(model))
+                        }
+                    }
+                    .disabled(busy)
+                }
+                Divider()
+                Button { sheet = .models } label: {
+                    Label("Models & context", systemImage: "slider.horizontal.3")
+                }
+            } label: {
+                selectorLabel(title, symbol: "cpu")
+            }
+            .accessibilityLabel("Model")
+            .accessibilityValue(title)
+        }
+    }
+
+    private func modelName(_ model: InstalledModel) -> String {
+        model.isPreset ? "Qwen3.5 4B" : model.title
+    }
+
     private var effortMenu: some View {
         let displayed = chat.activeEffort ?? effort
         return Menu {
@@ -631,20 +736,31 @@ private struct ChatScreen: View {
             }
             Text(effort.description)
         } label: {
-            HStack(spacing: 5) {
-                Text(displayed.title).lineLimit(1)
-                Image(systemName: "chevron.down").font(.system(size: 8, weight: .semibold))
-            }
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(NethPalette.muted)
-            .padding(.horizontal, 8)
-            .frame(minHeight: 44)
-            .contentShape(Rectangle())
-            .fixedSize(horizontal: true, vertical: false)
+            selectorLabel(displayed.title, symbol: "speedometer")
         }
         .disabled(busy)
         .accessibilityLabel("Effort")
         .accessibilityValue(displayed.title)
+    }
+
+    private func selectorLabel(_ title: String, symbol: String, trailing: String = "chevron.down") -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: symbol).foregroundStyle(NethPalette.muted).accessibilityHidden(true)
+            Text(title)
+                .lineLimit(1)
+                .foregroundStyle(NethPalette.text)
+            Spacer(minLength: 2)
+            Image(systemName: trailing)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(NethPalette.muted)
+                .accessibilityHidden(true)
+        }
+        .font(.system(.caption, design: .monospaced, weight: .medium))
+        .padding(.horizontal, 11)
+        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+        .background(NethPalette.inset, in: .rect(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(NethPalette.border).allowsHitTesting(false))
+        .contentShape(Rectangle())
     }
 
     private var sendControl: some View {
@@ -657,7 +773,7 @@ private struct ChatScreen: View {
                 .contentTransition(reduceMotion ? .identity : .symbolEffect(.replace))
                 .foregroundStyle(enabled ? NethPalette.canvas : NethPalette.muted)
                 .frame(width: 44, height: 44)
-                .background(enabled ? NethPalette.text : NethPalette.selected, in: .circle)
+                .background(enabled ? NethPalette.text : NethPalette.selected, in: .rect(cornerRadius: 8))
         }
         .buttonStyle(NethPress())
         .disabled(!enabled)
@@ -708,7 +824,6 @@ private struct ChatScreen: View {
         chat.newChat()
         resetComposer()
         sheet = nil
-        if models.current != nil { typing = true }
     }
 
     private func changeChat(_ id: String, at message: Int64? = nil) {
@@ -718,6 +833,7 @@ private struct ChatScreen: View {
     }
 
     private func resetComposer() {
+        typing = false
         draft = ""
         web = false
         makeFiles = false
