@@ -8,19 +8,19 @@ struct EffortMeter: View {
     let running: Bool
     let metrics: GenerationMetrics
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scene
 
     private var fraction: Double {
-        if total <= 1 { return 0.23 }
-        return min(0.93, max(0.12, (Double(step) - 0.35) / Double(total)))
+        min(0.96, max(0.12, (Double(step) - 0.35) / Double(max(1, total))))
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 7) {
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 10) {
                     status
                     Spacer(minLength: 0)
-                    readout.fixedSize(horizontal: true, vertical: false)
+                    signal.fixedSize(horizontal: true, vertical: false)
                 }
                 VStack(alignment: .leading, spacing: 4) {
                     status
@@ -33,24 +33,46 @@ struct EffortMeter: View {
                 GeometryReader { layout in
                     ZStack(alignment: .leading) {
                         Capsule().fill(NethPalette.border)
-                        Capsule().fill(NethPalette.violet)
-                            .frame(width: layout.size.width * fraction)
-                            .phaseAnimator(reduceMotion ? [1.0] : [1.0, 0.47]) { fill, opacity in
-                                fill.opacity(opacity)
-                            } animation: { _ in .easeInOut(duration: 0.85) }
-                            .animation(reduceMotion ? nil : NethMotion.reveal, value: fraction)
+                        progressFill(width: layout.size.width)
                     }
                 }
                 .frame(height: 2)
                 .accessibilityHidden(true)
             }
         }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(running ? NethPalette.violetSurface.opacity(0.47) : NethPalette.inset, in: .rect(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10)
+            .strokeBorder(running ? NethPalette.violet.opacity(0.25) : NethPalette.border.opacity(0.7))
+            .allowsHitTesting(false))
         .accessibilityElement(children: .combine)
+    }
+
+    @ViewBuilder
+    private func progressFill(width: CGFloat) -> some View {
+        let fill = LinearGradient(colors: [NethPalette.violet.opacity(0.5), NethPalette.lilac],
+                                  startPoint: .leading, endPoint: .trailing)
+        if total > 1 && step > 0 {
+            Capsule().fill(fill)
+                .frame(width: width * fraction)
+                .animation(reduceMotion ? nil : NethMotion.reveal, value: fraction)
+        } else {
+            let bandWidth = width * 0.23
+            Capsule().fill(fill)
+                .frame(width: bandWidth)
+                .phaseAnimator(reduceMotion || scene != .active ? [false] : [false, true]) { band, atEnd in
+                    band.offset(x: atEnd ? width - bandWidth : 0)
+                } animation: { _ in .easeInOut(duration: 1.35) }
+        }
     }
 
     private var status: some View {
         HStack(spacing: 7) {
             NethMascotMark(active: running)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 3)
+                .background(running ? NethPalette.violetSurface : NethPalette.rail, in: .rect(cornerRadius: 5))
             Text(verbatim: activity)
                 .lineLimit(1)
                 .contentTransition(.opacity)
@@ -62,6 +84,30 @@ struct EffortMeter: View {
         .foregroundStyle(NethPalette.muted)
     }
 
+    private var signal: some View {
+        HStack(spacing: 12) {
+            if !metrics.speeds.isEmpty { speedGraph }
+            readout
+        }
+    }
+
+    private var speedGraph: some View {
+        let scale = max(1, metrics.speeds.max() ?? 0)
+        let missing = GenerationMetrics.speedSampleLimit - metrics.speeds.count
+        return HStack(alignment: .bottom, spacing: 2) {
+            ForEach(0..<GenerationMetrics.speedSampleLimit, id: \.self) { index in
+                let sample = index >= missing ? metrics.speeds[index - missing] : 0
+                let height = sample > 0 ? 3 + 13 * (sample / scale) : 2
+                Capsule()
+                    .fill(sample > 0 ? NethPalette.violet.opacity(0.40 + Double(index) * 0.05) : NethPalette.border)
+                    .frame(width: 2.5, height: height)
+                    .animation(reduceMotion ? nil : NethMotion.reveal, value: height)
+            }
+        }
+        .frame(height: 16, alignment: .bottom)
+        .accessibilityHidden(true)
+    }
+
     private var readout: some View {
         HStack(spacing: 9) {
             Text("\(metrics.tokens.formatted()) \(metrics.tokens == 1 ? "token" : "tokens")")
@@ -69,7 +115,10 @@ struct EffortMeter: View {
                 .contentTransition(.numericText())
                 .animation(reduceMotion ? nil : NethMotion.press, value: metrics.tokens)
             let rate = metrics.tokensPerSecond?.formatted(.number.precision(.fractionLength(1))) ?? "—"
-            Text("\(rate) tok/s").foregroundStyle(NethPalette.muted)
+            Text("\(rate) tok/s")
+                .foregroundStyle(NethPalette.muted)
+                .contentTransition(.numericText())
+                .animation(reduceMotion ? nil : NethMotion.press, value: rate)
         }
         .font(.system(.caption, design: .monospaced, weight: .medium))
         .monospacedDigit()
@@ -151,9 +200,9 @@ struct WorkspaceFileCard: View {
                 } label: {
                     HStack(spacing: 10) {
                         Image(systemName: file.name.hasSuffix(".zip") ? "archivebox" : "doc.text")
-                            .foregroundStyle(NethPalette.text)
+                            .foregroundStyle(NethPalette.lilac)
                             .frame(width: 34, height: 34)
-                            .background(NethPalette.selected, in: .rect(cornerRadius: 8))
+                            .background(NethPalette.violetSurface, in: .rect(cornerRadius: 8))
                         VStack(alignment: .leading, spacing: 3) {
                             Text(verbatim: file.name)
                                 .font(.subheadline.weight(.semibold))

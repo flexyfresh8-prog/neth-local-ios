@@ -6,7 +6,7 @@ Neth Local runs GGUF models on the iPad with llama.cpp. It downloads the HauhauC
 
 Run **Build iPad IPAs** in GitHub Actions and download the **NethLocal-iPad** artifact. For a local build on macOS with Xcode and the iPhoneOS SDK, run `bash scripts/build-ipa.sh`. The same files are written to `out/`.
 
-For Impactor choose `NethLocal-Impactor.ipa`, select **Signing → Apple ID**, leave the custom **Entitlements** field empty, and click **Install**. The app executable carries the Increased Memory Limit and Extended Virtual Addressing requests for Impactor to discover. Apple's provisioning profile determines which capabilities the signed app receives. The build also includes an unsigned package and the entitlement plist for other signing workflows. Both packages target ARM64 on iPadOS 18 and later. [Apple’s Increased Memory Limit documentation](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.kernel.increased-memory-limit)
+Both IPA filenames include the app version. For Impactor choose `NethLocal-v<version>-Impactor.ipa`, select **Signing → Apple ID**, leave the custom **Entitlements** field empty, and click **Install**. The app executable carries the Increased Memory Limit and Extended Virtual Addressing requests for Impactor to discover. Apple's provisioning profile determines which capabilities the signed app receives. The build also includes an unsigned package and the entitlement plist for other signing workflows. Both packages target ARM64 on iPadOS 18 and later. [Apple’s Increased Memory Limit documentation](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.kernel.increased-memory-limit)
 
 ## Run a model
 

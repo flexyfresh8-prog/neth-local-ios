@@ -121,6 +121,11 @@ struct ChatChecks {
         precondition(firstPass.addingPass(tokens: 1, seconds: 0).tokens == 12)
         let secondPass = firstPass.addingPass(tokens: 8, seconds: 1)
         precondition(secondPass.tokens == 19 && secondPass.tokensPerSecond == 7)
+        var liveMetrics = secondPass
+        for speed in 1...16 { liveMetrics.recordSpeed(Double(speed)) }
+        liveMetrics.recordSpeed(.infinity)
+        precondition(liveMetrics.speeds == (5...16).map(Double.init))
+        precondition(liveMetrics.addingPass(tokens: 2, seconds: 1).speeds == liveMetrics.speeds)
         precondition(QuattroPlan.looksComplete("{\"a\": 1}", path: "data.json"))
         precondition(!QuattroPlan.looksComplete("{\"a\": ", path: "data.json"))
         try await checkQuattro(tools)

@@ -8,6 +8,7 @@ struct ChatMessageRow: View, Equatable {
     let allowActions: Bool
     let resume: () -> Void
     let save: (String, String) -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.message == rhs.message && lhs.streaming == rhs.streaming && lhs.activity == rhs.activity
@@ -39,7 +40,11 @@ struct ChatMessageRow: View, Equatable {
         }
         .padding(.horizontal, 17)
         .padding(.vertical, 13)
-        .background(NethPalette.surface, in: .rect(cornerRadius: 17))
+        .background(LinearGradient(colors: [NethPalette.violetSurface.opacity(0.90), NethPalette.surface],
+                                   startPoint: .topTrailing, endPoint: .bottomLeading), in: .rect(cornerRadius: 17))
+        .overlay(RoundedRectangle(cornerRadius: 17)
+            .strokeBorder(NethPalette.violet.opacity(0.14))
+            .allowsHitTesting(false))
         .frame(maxWidth: 550, alignment: .trailing)
         .frame(maxWidth: .infinity, alignment: .trailing)
     }
@@ -49,6 +54,9 @@ struct ChatMessageRow: View, Equatable {
         return VStack(alignment: .leading, spacing: 13) {
             HStack(spacing: 9) {
                 NethMascotMark(active: streaming)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 4)
+                    .background(streaming ? NethPalette.violetSurface : NethPalette.rail, in: .rect(cornerRadius: 6))
                 Text(message.metadata?.quattro == true ? "Quattro" : "Neth Local")
                     .font(.subheadline.weight(.semibold))
                     .accessibilityAddTraits(.isHeader)
@@ -60,10 +68,14 @@ struct ChatMessageRow: View, Equatable {
             }
             if message.text.isEmpty && streaming {
                 HStack(spacing: 9) {
-                    ProgressView().controlSize(.small)
+                    ProgressView().controlSize(.small).tint(NethPalette.violet)
                     Text(activity ?? "Preparing…").font(.subheadline)
                 }
                 .foregroundStyle(NethPalette.muted)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(NethPalette.rail, in: .capsule)
+                .transition(reduceMotion ? .identity : .opacity)
             }
             if let thought = content.reasoning, !thought.isEmpty {
                 DisclosureGroup(streaming && !content.reasoningComplete ? "Thinking…" : "Reasoning") {
@@ -114,6 +126,7 @@ struct ChatMessageRow: View, Equatable {
                     HStack(spacing: 6) { replyActions(content.answer) }
                     VStack(alignment: .leading, spacing: 3) { replyActions(content.answer) }
                 }
+                .transition(reduceMotion ? .identity : NethMotion.rise)
             }
             if !streaming, let reason = message.metadata?.finish.label ?? (content.hasOpenFence ? "Open code block" : nil) {
                 ViewThatFits(in: .horizontal) {
@@ -125,6 +138,8 @@ struct ChatMessageRow: View, Equatable {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .animation(reduceMotion ? nil : NethMotion.fade, value: message.text.isEmpty)
+        .animation(reduceMotion ? nil : NethMotion.reveal, value: streaming)
     }
 
     @ViewBuilder
@@ -252,9 +267,10 @@ private struct CopyControl: View {
             Label(copiedAt != nil ? "Copied" : compact ? "Copy reply" : "Copy",
                   systemImage: copiedAt != nil ? "checkmark" : "doc.on.doc")
                 .font(.caption.weight(.medium))
-                .foregroundStyle(copiedAt != nil ? NethPalette.text : NethPalette.muted)
+                .foregroundStyle(copiedAt != nil ? NethPalette.lilac : NethPalette.muted)
                 .padding(.horizontal, 7)
                 .frame(minHeight: 44)
+                .background(copiedAt != nil ? NethPalette.violetSurface : .clear, in: .rect(cornerRadius: 8))
                 .contentTransition(.opacity)
                 .contentShape(Rectangle())
                 .animation(reduceMotion ? nil : NethMotion.fade, value: copiedAt != nil)

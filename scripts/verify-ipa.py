@@ -2,6 +2,7 @@ import plistlib
 import stat
 import struct
 import sys
+from pathlib import Path
 from zipfile import ZipFile
 
 
@@ -45,7 +46,8 @@ def verify_ios_binary(ipa, path, executable=False, expected_entitlements=None):
             assert plistlib.loads(blob[start + 8:start + size]) == expected_entitlements
 
 
-with ZipFile(sys.argv[1]) as ipa:
+package = Path(sys.argv[1])
+with ZipFile(package) as ipa:
     assert ipa.testzip() is None
     names = ipa.namelist()
     app = "Payload/NethLocal.app/"
@@ -57,6 +59,10 @@ with ZipFile(sys.argv[1]) as ipa:
     assert entitlements["com.apple.developer.kernel.increased-memory-limit"] is True
     assert entitlements["com.apple.developer.kernel.extended-virtual-addressing"] is True
     impactor = "--impactor" in sys.argv[2:]
+    if package.name.startswith("NethLocal-v"):
+        variant = "Impactor" if impactor else "unsigned"
+        expected = f"NethLocal-v{info['CFBundleShortVersionString']}-{variant}.ipa"
+        assert package.name == expected, f"Expected {expected}, got {package.name}"
     verify_ios_binary(ipa, app + info["CFBundleExecutable"], executable=True,
                       expected_entitlements=entitlements if impactor else None)
     verify_ios_binary(ipa, app + "Frameworks/llama.framework/llama")

@@ -30,8 +30,8 @@ jobs:
         with:
           name: NethLocal-iPad
           path: |
-            out/NethLocal-unsigned.ipa
-            out/NethLocal-Impactor.ipa
+            out/NethLocal-v*-unsigned.ipa
+            out/NethLocal-v*-Impactor.ipa
             out/NethLocal.entitlements
           if-no-files-found: error
           compression-level: 0

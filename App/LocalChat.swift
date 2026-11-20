@@ -351,7 +351,8 @@ final class LocalChat: ObservableObject {
                             keepActivity: Bool, receive: (String) async throws -> Void) async throws -> ReplyFinish {
         var finish: ReplyFinish = .stopped
         var received = false
-        let previousPasses = generation
+        var previousPasses = generation
+        var lastSample: (tokens: Int, seconds: Double)?
         for try await event in engine.stream(request, in: id, settings: settings, stop: stop) {
             switch event {
             case .loading(let backend):
@@ -367,7 +368,11 @@ final class LocalChat: ObservableObject {
             case .prompt(let metrics):
                 promptMetrics = metrics
             case .progress(let count, let seconds):
+                if let lastSample, seconds > lastSample.seconds {
+                    previousPasses.recordSpeed(Double(count - lastSample.tokens) / (seconds - lastSample.seconds))
+                }
                 generation = previousPasses.addingPass(tokens: count, seconds: seconds)
+                lastSample = (count, seconds)
             case .finished(let reason):
                 finish = reason
             }

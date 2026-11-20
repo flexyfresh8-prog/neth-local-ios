@@ -1,11 +1,22 @@
 import Foundation
 
 struct GenerationMetrics: Equatable, Sendable {
+    static let speedSampleLimit = 12
     var tokens = 0
     var tokensPerSecond: Double?
+    private(set) var speeds: [Double] = []
 
     func addingPass(tokens count: Int, seconds: Double) -> Self {
-        Self(tokens: tokens + count, tokensPerSecond: count > 1 && seconds > 0 ? Double(count - 1) / seconds : nil)
+        var total = self
+        total.tokens += count
+        total.tokensPerSecond = count > 1 && seconds > 0 ? Double(count - 1) / seconds : nil
+        return total
+    }
+
+    mutating func recordSpeed(_ speed: Double) {
+        guard speed.isFinite && speed > 0 else { return }
+        speeds.append(speed)
+        if speeds.count > Self.speedSampleLimit { speeds.removeFirst() }
     }
 }
 

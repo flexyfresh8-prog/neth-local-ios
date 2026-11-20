@@ -10,6 +10,10 @@ output="$root/out"
 engine_dir="$work/$engine_tag"
 payload="$work/package/Payload"
 app="$payload/NethLocal.app"
+version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' App/Info.plist)"
+[[ "$version" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]
+unsigned="$output/NethLocal-v$version-unsigned.ipa"
+impactor="$output/NethLocal-v$version-Impactor.ipa"
 
 mkdir -p "$work" "$output"
 archive="$work/llama-$engine_tag-xcframework.zip"
@@ -74,9 +78,9 @@ done
 find "$app" -type d -name _CodeSignature -prune -exec rm -rf {} +
 xcrun otool -L "$app/NethLocal"
 
-rm -f "$output/NethLocal-unsigned.ipa" "$output/NethLocal-Impactor.ipa"
-ditto -c -k --norsrc --keepParent "$payload" "$output/NethLocal-unsigned.ipa"
-python3 scripts/verify-ipa.py "$output/NethLocal-unsigned.ipa"
+rm -f "$unsigned" "$impactor"
+ditto -c -k --norsrc --keepParent "$payload" "$unsigned"
+python3 scripts/verify-ipa.py "$unsigned"
 
 # Impactor reads capability requests from the original main executable.
 # It creates its own Apple ID signature and provisioning profile at install.
@@ -84,5 +88,5 @@ impactor_executable="$work/NethLocal-Impactor"
 cp "$app/NethLocal" "$impactor_executable"
 codesign --force --sign - --identifier com.neth.local --entitlements NethLocal.entitlements "$impactor_executable"
 cp "$impactor_executable" "$app/NethLocal"
-ditto -c -k --norsrc --keepParent "$payload" "$output/NethLocal-Impactor.ipa"
-python3 scripts/verify-ipa.py "$output/NethLocal-Impactor.ipa" --impactor
+ditto -c -k --norsrc --keepParent "$payload" "$impactor"
+python3 scripts/verify-ipa.py "$impactor" --impactor
