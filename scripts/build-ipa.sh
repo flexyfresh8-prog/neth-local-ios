@@ -80,6 +80,9 @@ python3 scripts/verify-ipa.py "$output/NethLocal-unsigned.ipa"
 
 # Impactor reads capability requests from the original main executable.
 # It creates its own Apple ID signature and provisioning profile at install.
-codesign --force --sign - --identifier com.neth.local --entitlements NethLocal.entitlements "$app/NethLocal"
+impactor_executable="$work/NethLocal-Impactor"
+cp "$app/NethLocal" "$impactor_executable"
+codesign --force --sign - --identifier com.neth.local --entitlements NethLocal.entitlements "$impactor_executable"
+cp "$impactor_executable" "$app/NethLocal"
 ditto -c -k --norsrc --keepParent "$payload" "$output/NethLocal-Impactor.ipa"
 python3 scripts/verify-ipa.py "$output/NethLocal-Impactor.ipa" --impactor
