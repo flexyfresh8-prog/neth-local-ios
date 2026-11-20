@@ -16,7 +16,7 @@ final class QuattroAgent {
 
     func run(reply: inout ChatMessage, task: ChatMessage, conversation: String, historyFiles: [WorkspaceFile],
              settings: RunSettings, report: (String, Int, Int) -> Void,
-             stream: Stream, checkpoint: Checkpoint) async throws -> QuattroOutcome {
+             stream: Stream, checkpoint: @escaping Checkpoint) async throws -> QuattroOutcome {
         let text = task.text
         let context = ToolContext(conversation: conversation, before: task.id, web: settings.web,
                                   files: historyFiles)
@@ -121,7 +121,7 @@ final class QuattroAgent {
 
     private func build(project initial: ProjectWork, request: String, reply: inout ChatMessage,
                        effort: EffortPreset, conversation: String, report: (String, Int, Int) -> Void,
-                       stream: Stream, checkpoint: Checkpoint) async throws {
+                       stream: Stream, checkpoint: @escaping Checkpoint) async throws {
         var project = initial
         while project.cursor < project.files.count {
             let file = project.files[project.cursor]
@@ -140,6 +140,8 @@ final class QuattroAgent {
             for _ in 0..<effort.filePasses {
                 if Task.isCancelled { reason = .stopped; break }
                 let previous = project.draft
+                let projectAtStart = project
+                let replyAtStart = reply
                 var segment = ""
                 var savedAt = Date()
                 let writing = ModelRequest(history: [ChatMessage(role: .user, text: prompt)], evidence: reply.evidence,
@@ -150,9 +152,9 @@ final class QuattroAgent {
                         segment += $0
                         let now = Date()
                         if now.timeIntervalSince(savedAt) >= 3 {
-                            var saved = project
+                            var saved = projectAtStart
                             saved.draft = previous + segment
-                            var snapshot = reply
+                            var snapshot = replyAtStart
                             snapshot.metadata?.project = saved
                             try await checkpoint(snapshot, true)
                             savedAt = now
