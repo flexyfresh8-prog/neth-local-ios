@@ -34,6 +34,7 @@ private struct ChatScreen: View {
     @AppStorage("thinking") private var thinking = false
     @AppStorage("cachePrecision") private var cache = CachePrecision.automatic
     @AppStorage("compactHistory") private var compactHistory = true
+    @AppStorage("promptCacheMode") private var promptCache = PromptCacheMode.storage
     @AppStorage("effortPreset") private var effort = EffortPreset.balanced
     @AppStorage("quattroEnabled") private var quattro = false
     @Environment(\.scenePhase) private var scene
@@ -89,7 +90,10 @@ private struct ChatScreen: View {
             case .models:
                 ModelPanel(models: models, context: $context, cpuOnly: $cpuOnly,
                            thinking: $thinking, cache: $cache, compactHistory: $compactHistory,
-                           active: chat.profile, inferenceBusy: busy) { chat.unload() }
+                           promptCache: $promptCache, active: chat.profile, metrics: chat.promptMetrics,
+                           checkpointNotice: chat.checkpointNotice, inferenceBusy: busy,
+                           unload: { chat.unload() }, saveAndUnload: { await chat.saveAndUnload() },
+                           clearCheckpoints: { await chat.clearPromptCheckpoints() })
             case .tools:
                 QuattroPanel { tool in
                     quattro = true
@@ -132,7 +136,12 @@ private struct ChatScreen: View {
         .onChange(of: context) { _, _ in chat.unload() }
         .onChange(of: cache) { _, _ in chat.unload() }
         .onChange(of: cpuOnly) { _, _ in chat.unload() }
-        .onChange(of: scene) { _, phase in if phase == .background { chat.unload() } }
+        .onChange(of: promptCache) { _, mode in chat.setPromptCache(mode) }
+        .onChange(of: scene) { _, phase in
+            if phase == .background {
+                if promptCache == .storage { chat.background() } else { chat.unload() }
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
             chat.unload()
         }
@@ -628,7 +637,7 @@ private struct ChatScreen: View {
         guard let model = models.current else { return nil }
         return EngineSettings(model: model, projector: canAttach ? models.projector : nil,
                               context: context, cpuOnly: cpuOnly, thinking: thinking,
-                              cache: cache, compactHistory: compactHistory)
+                              cache: cache, compactHistory: compactHistory, promptCache: promptCache)
     }
 
     private func continueReply(_ reply: ChatMessage) {

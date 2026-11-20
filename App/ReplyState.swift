@@ -112,7 +112,7 @@ struct RunSettings: Sendable {
 }
 
 struct ModelRequest: Sendable {
-    let history: [ChatMessage]
+    var history: [ChatMessage]
     var evidence: WebEvidence? = nil
     var recall: [TranscriptMatch] = []
     var digest: ContextDigest? = nil

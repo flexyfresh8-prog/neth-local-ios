@@ -2,10 +2,12 @@
 
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <vector>
@@ -28,6 +30,11 @@ struct NLCancel {
     std::atomic<bool> requested{false};
 };
 
+struct NLWarmPrompt {
+    std::vector<llama_token> tokens;
+    std::vector<uint8_t> recurrent;
+};
+
 struct NLRuntime {
     llama_model *model = nullptr;
     llama_context *context = nullptr;
@@ -36,6 +43,7 @@ struct NLRuntime {
     bool qwen = false;
     bool metal = false;
     int32_t cache = 3;
+    NLWarmPrompt warm;
 
     ~NLRuntime() {
         if (vision) mtmd_free(vision);
@@ -163,15 +171,124 @@ void nl_close(NLRuntime *runtime) { delete runtime; }
 int32_t nl_context_window(const NLRuntime *runtime) { return llama_n_ctx_seq(runtime->context); }
 int32_t nl_context_cache(const NLRuntime *runtime) { return runtime->cache; }
 
-static std::string qwen_prompt(const NLMessage *messages, size_t first, size_t count,
-                               size_t picture, const char *reference, bool thinking, const std::string &prefix) {
-    std::string prompt;
-    if (reference && *reference) {
-        prompt = "<|im_start|>system\n";
-        prompt += reference;
-        prompt += "<|im_end|>\n";
+void nl_forget_prompt(NLRuntime *runtime) {
+    runtime->warm = {};
+}
+
+static void clear_context(NLRuntime *runtime) {
+    nl_forget_prompt(runtime);
+    llama_synchronize(runtime->context);
+    llama_memory_clear(llama_get_memory(runtime->context), true);
+}
+
+static bool has_headroom(size_t bytes) {
+#ifdef __APPLE__
+    return nl_available_memory() > bytes + 96 * 1024 * 1024;
+#else
+    (void)bytes;
+    return true;
+#endif
+}
+
+// Keep the full attention cache in the context. Save only the recurrent tensors
+// needed to rewind to the boundary before per-turn references and assistant output.
+static constexpr auto recurrent_only = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+static constexpr size_t minimum_warm_tokens = 256;
+static constexpr size_t minimum_disk_tokens = 1024;
+
+static bool rewind_prompt(NLRuntime &runtime) {
+    const auto &warm = runtime.warm;
+    if (warm.tokens.empty() || warm.recurrent.empty()) return false;
+    auto *context = runtime.context;
+    auto *memory = llama_get_memory(context);
+    const auto end = static_cast<llama_pos>(warm.tokens.size());
+    if (llama_memory_seq_pos_max(memory, 0) < end - 1) return false;
+    return llama_state_seq_set_data_ext(context, warm.recurrent.data(), warm.recurrent.size(), 0, recurrent_only)
+               == warm.recurrent.size()
+        && llama_memory_seq_rm(memory, 0, end, -1)
+        && llama_memory_seq_pos_max(memory, 0) == end - 1;
+}
+
+static void remember_prompt(NLRuntime &runtime, const std::vector<llama_token> &tokens, size_t count) {
+    const auto size = llama_state_seq_get_size_ext(runtime.context, 0, recurrent_only);
+    if (!size || (runtime.warm.recurrent.capacity() < size && !has_headroom(size))) return;
+    try {
+        auto &warm = runtime.warm;
+        warm.recurrent.resize(size);
+        if (llama_state_seq_get_data_ext(runtime.context, warm.recurrent.data(), size, 0, recurrent_only) != size) {
+            warm = {};
+            return;
+        }
+        warm.tokens.assign(tokens.begin(), tokens.begin() + count);
+    } catch (const std::bad_alloc &) {
+        runtime.warm = {};
     }
+}
+
+struct CheckpointMatch {
+    size_t tokens = 0;
+    size_t bytes = 0;
+};
+
+static CheckpointMatch matching_checkpoint(const char *path, const std::vector<llama_token> &prompt,
+                                           size_t stable_count) {
+    if (!path || stable_count < minimum_disk_tokens) return {};
+    const auto close = [](std::FILE *file) { std::fclose(file); };
+    std::unique_ptr<std::FILE, decltype(close)> file(std::fopen(path, "rb"), close);
+    if (!file) return {};
+
+    // b12549 writes magic, version, token count and token IDs before the tensors.
+    // Read that prefix first, so a prompt mismatch never loads the tensor data.
+    uint32_t header[3];
+    if (std::fread(header, sizeof(uint32_t), 3, file.get()) != 3 || header[0] != LLAMA_STATE_SEQ_MAGIC
+        || header[1] != LLAMA_STATE_SEQ_VERSION || header[2] < minimum_disk_tokens || header[2] > stable_count) {
+        return {};
+    }
+    size_t offset = 0;
+    const size_t count = header[2];
+    while (offset < count) {
+        llama_token ids[512];
+        const size_t length = std::min(count - offset, size_t{512});
+        if (std::fread(ids, sizeof(llama_token), length, file.get()) != length
+            || !std::equal(ids, ids + length, prompt.begin() + offset)) return {};
+        offset += length;
+    }
+    if (std::fseek(file.get(), 0, SEEK_END) != 0) return {};
+    const auto bytes = std::ftell(file.get());
+    if (bytes <= static_cast<long>(sizeof(header) + count * sizeof(llama_token))) return {};
+    return {count, static_cast<size_t>(bytes)};
+}
+
+size_t nl_save_prompt(NLRuntime *runtime, const char *path, const char *temporary_path, size_t byte_limit) {
+    if (!path || !temporary_path || runtime->warm.tokens.size() < minimum_disk_tokens) return 0;
+    const auto &tokens = runtime->warm.tokens;
+    const auto existing = matching_checkpoint(path, tokens, tokens.size());
+    if (existing.tokens == tokens.size()) return existing.bytes;
+    if (!rewind_prompt(*runtime)) {
+        nl_forget_prompt(runtime);
+        return 0;
+    }
+    const auto bytes = llama_state_seq_get_size(runtime->context, 0) + tokens.size() * sizeof(llama_token)
+        + 3 * sizeof(uint32_t);
+    // The upstream reader/writer stages one tensor range at a time, not the full state.
+    if (bytes > byte_limit || !has_headroom(bytes / 8)) return 0;
+    const auto written = llama_state_seq_save_file(runtime->context, temporary_path, 0, tokens.data(), tokens.size());
+    const auto checked = written ? matching_checkpoint(temporary_path, tokens, tokens.size()) : CheckpointMatch{};
+    if (checked.bytes == written && written && std::rename(temporary_path, path) == 0) return written;
+    std::remove(temporary_path);
+    return 0;
+}
+
+static void qwen_reference(std::string &prompt, const char *reference) {
+    if (!reference || !*reference) return;
+    prompt += "<|im_start|>system\n";
+    prompt += reference;
+    prompt += "<|im_end|>\n";
+}
+
+static void qwen_history(std::string &prompt, const NLMessage *messages, size_t first, size_t count, size_t picture) {
     for (size_t i = first; i < count; ++i) {
+        if (i != first) prompt += '\n';
         std::string text = messages[i].text;
         prompt += "<|im_start|>";
         prompt += messages[i].role;
@@ -188,12 +305,14 @@ static std::string qwen_prompt(const NLMessage *messages, size_t first, size_t c
             text = answer == std::string::npos ? "" : text.substr(answer);
         }
         prompt += text;
-        prompt += "<|im_end|>\n";
+        prompt += "<|im_end|>";
     }
+}
+
+static void qwen_assistant(std::string &prompt, bool thinking, const std::string &prefix) {
     prompt += "<|im_start|>assistant\n<think>\n";
     if (!thinking) prompt += "\n</think>\n\n";
     prompt += prefix;
-    return prompt;
 }
 
 static std::string model_prompt(const NLRuntime &runtime, const NLMessage *messages,
@@ -253,7 +372,14 @@ static void emit_text(std::string &pending, NLChunk chunk, void *user) {
 int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
                     const NLGeneration *options,
                     NLCancel *cancel, NLChunk chunk, void *user, int32_t *generated,
-                    int32_t *finish, char *error, size_t error_size) {
+                    int32_t *finish, NLPromptStats *stats, char *error, size_t error_size) {
+    using clock = std::chrono::steady_clock;
+    const auto start = clock::now();
+    const auto milliseconds_since = [](clock::time_point time) {
+        return std::chrono::duration<double, std::milli>(clock::now() - time).count();
+    };
+    *stats = {};
+    stats->first_token_ms = -1;
     *generated = 0;
     *finish = NL_FINISH_STOPPED;
     if (stopped(cancel)) return NL_STOPPED;
@@ -279,7 +405,8 @@ int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
     auto *vocab = llama_model_get_vocab(runtime->model);
     const int32_t capacity = static_cast<int32_t>(llama_n_ctx_seq(context));
     const int32_t batch_size = static_cast<int32_t>(llama_n_batch(context));
-    llama_memory_clear(llama_get_memory(context), true);
+    const bool text_qwen = runtime->qwen && picture == no_picture;
+    const bool reuse = text_qwen && options->reuse_prompt;
     llama_set_abort_callback(context, stopped, cancel);
     struct ResetAbort {
         llama_context *context;
@@ -330,18 +457,39 @@ int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
     std::unique_ptr<mtmd_input_chunks, decltype(&mtmd_input_chunks_free)> chunks(
         mtmd_input_chunks_init(), mtmd_input_chunks_free);
     size_t first = 0;
+    int32_t stable = 0;
     int32_t used = 0;
     const int32_t reserve = std::min(output_limit, std::max(96, capacity / 4));
     for (;;) {
         if (stopped(cancel)) return NL_STOPPED;
         const auto active_picture = picture != no_picture && picture >= first ? picture : no_picture;
-        auto prompt = runtime->qwen ? qwen_prompt(messages, first, count, active_picture, reference, thinking, prefix)
-                                    : model_prompt(*runtime, messages, first, count, reference, prefix);
+        std::string prompt;
+        if (text_qwen) {
+            // The special end-of-message token makes this split stable when references change.
+            qwen_history(prompt, messages, first, count, no_picture);
+            tokens = tokenize(vocab, prompt);
+            stable = static_cast<int32_t>(tokens.size());
+            prompt = "\n";
+            qwen_reference(prompt, reference);
+            qwen_assistant(prompt, thinking, prefix);
+            const auto tail = tokenize(vocab, prompt, false);
+            tokens.insert(tokens.end(), tail.begin(), tail.end());
+            used = stable && !tail.empty() ? static_cast<int32_t>(tokens.size()) : 0;
+        } else if (runtime->qwen) {
+            qwen_reference(prompt, reference);
+            qwen_history(prompt, messages, first, count, active_picture);
+            prompt += '\n';
+            qwen_assistant(prompt, thinking, prefix);
+        } else {
+            prompt = model_prompt(*runtime, messages, first, count, reference, prefix);
+        }
         if (prompt.empty()) {
             report(error, error_size, "The engine does not recognize this model’s chat template.");
             return NL_ERROR;
         }
-        if (active_picture != no_picture) {
+        if (text_qwen) {
+            chunks.reset();
+        } else if (active_picture != no_picture) {
             const mtmd_input_text text{prompt.data(), prompt.size(), true, true};
             const mtmd_bitmap *images[] = {bitmap.get()};
             chunks.reset(mtmd_input_chunks_init());
@@ -351,7 +499,7 @@ int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
             }
             used = static_cast<int32_t>(mtmd_helper_get_n_tokens(chunks.get()));
         } else {
-            mtmd_input_chunks_free(chunks.release());
+            chunks.reset();
             tokens = tokenize(vocab, prompt);
             used = static_cast<int32_t>(tokens.size());
         }
@@ -376,6 +524,36 @@ int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
 
     llama_pos position = 0;
     int32_t status = 0;
+    const auto prefill = clock::now();
+    stats->prompt_tokens = used;
+    const auto &previous = runtime->warm.tokens;
+    if (reuse && !previous.empty() && previous.size() <= static_cast<size_t>(stable)
+        && std::equal(previous.begin(), previous.end(), tokens.begin()) && rewind_prompt(*runtime)) {
+        position = static_cast<llama_pos>(previous.size());
+        stats->source = NL_PROMPT_MEMORY;
+    } else {
+        clear_context(runtime);
+        if (reuse && !stopped(cancel)) {
+            const auto saved = matching_checkpoint(options->checkpoint_path, tokens, stable);
+            if (saved.tokens && has_headroom(saved.bytes / 8)) {
+                std::vector<llama_token> persisted(saved.tokens);
+                size_t restored = 0;
+                const auto read = llama_state_seq_load_file(context, options->checkpoint_path, 0,
+                    persisted.data(), persisted.size(), &restored);
+                if (read == saved.bytes && restored == saved.tokens
+                    && std::equal(persisted.begin(), persisted.end(), tokens.begin())
+                    && llama_memory_seq_pos_max(llama_get_memory(context), 0) == static_cast<llama_pos>(restored) - 1) {
+                    position = static_cast<llama_pos>(restored);
+                    stats->source = NL_PROMPT_STORAGE;
+                } else {
+                    clear_context(runtime);
+                    std::remove(options->checkpoint_path);
+                }
+            }
+        }
+    }
+    stats->reused_tokens = position;
+
     std::unique_ptr<llama_batch_ext, decltype(&llama_batch_ext_free)> batch(
         llama_batch_ext_init(context), llama_batch_ext_free);
     const auto add_token = [&](llama_token token, bool logits) {
@@ -386,27 +564,42 @@ int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
         return true;
     };
     if (chunks) {
-        status = mtmd_helper_eval_chunks(runtime->vision, context, chunks.get(), 0, 0,
-                                          batch_size, true, &position);
+        if (!stopped(cancel)) {
+            status = mtmd_helper_eval_chunks(runtime->vision, context, chunks.get(), 0, 0,
+                                              batch_size, true, &position);
+        }
     } else {
-        while (position < used && !stopped(cancel)) {
-            const auto size = std::min(batch_size, used - position);
-            llama_batch_ext_clear(batch.get());
-            for (int32_t i = 0; i < size; ++i) {
-                if (!add_token(tokens[position], position + 1 == used)) {
-                    report(error, error_size, "The engine could not prepare the prompt.");
-                    return NL_ERROR;
+        const auto evaluate = [&](int32_t end) {
+            while (position < end && !stopped(cancel)) {
+                const auto size = std::min(batch_size, end - position);
+                llama_batch_ext_clear(batch.get());
+                for (int32_t i = 0; i < size; ++i) {
+                    if (!add_token(tokens[position], position + 1 == used)) return false;
                 }
+                status = llama_process(context, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                if (status != 0) break;
             }
-            status = llama_process(context, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-            if (status != 0) break;
+            return true;
+        };
+        bool prepared = stable == 0 || evaluate(stable);
+        if (prepared && status == 0 && !stopped(cancel) && reuse
+            && static_cast<size_t>(stable) >= minimum_warm_tokens && runtime->warm.tokens.size() != static_cast<size_t>(stable)) {
+            remember_prompt(*runtime, tokens, stable);
+        }
+        if (prepared && status == 0) prepared = evaluate(used);
+        if (!prepared) {
+            report(error, error_size, "The engine could not prepare the prompt.");
+            return NL_ERROR;
         }
     }
+    if (status != 0) runtime->warm = {};
     if (stopped(cancel)) return NL_STOPPED;
     if (status != 0) {
         report(error, error_size, "The engine could not evaluate the prompt. Try a shorter context or CPU mode.");
         return NL_RETRY;
     }
+    stats->prefill_ms = milliseconds_since(prefill);
+    stats->prefill_headroom = nl_available_memory();
 
     std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)> sampler(
         llama_sampler_chain_init(llama_sampler_chain_default_params()), llama_sampler_free);
@@ -418,10 +611,14 @@ int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
         }
         llama_sampler_chain_add(sampler.get(), grammar);
     }
-    llama_sampler_chain_add(sampler.get(), llama_sampler_init_top_k(20));
-    llama_sampler_chain_add(sampler.get(), llama_sampler_init_top_p(thinking ? 0.95f : 0.80f, 1));
-    llama_sampler_chain_add(sampler.get(), llama_sampler_init_temp(structured ? 0.15f : thinking ? 0.60f : 0.70f));
-    llama_sampler_chain_add(sampler.get(), llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+    if (options->deterministic) {
+        llama_sampler_chain_add(sampler.get(), llama_sampler_init_greedy());
+    } else {
+        llama_sampler_chain_add(sampler.get(), llama_sampler_init_top_k(20));
+        llama_sampler_chain_add(sampler.get(), llama_sampler_init_top_p(thinking ? 0.95f : 0.80f, 1));
+        llama_sampler_chain_add(sampler.get(), llama_sampler_init_temp(structured ? 0.15f : thinking ? 0.60f : 0.70f));
+        llama_sampler_chain_add(sampler.get(), llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+    }
 
     const int32_t window_left = capacity - used;
     const int32_t steps = std::min(output_limit, window_left);
@@ -451,6 +648,7 @@ int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
                 }
             }
             if (llama_process(context, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                runtime->warm = {};
                 if (stopped(cancel)) break;
                 report(error, error_size, "The engine could not finish reasoning.");
                 return NL_ERROR;
@@ -481,14 +679,16 @@ int32_t nl_generate(NLRuntime *runtime, const NLMessage *messages, size_t count,
             if (thought_tail.size() > 16) thought_tail.erase(0, thought_tail.size() - 16);
         }
         pending += piece;
+        if (*generated == 0) stats->first_token_ms = milliseconds_since(start);
         ++*generated;
         ++charged;
         emit_text(pending, chunk, user);
         if (charged >= steps) break;
 
         llama_batch_ext_clear(batch.get());
-        if ((!add_token(token, true) || llama_process(context, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0)
-            && !stopped(cancel)) {
+        if (!add_token(token, true) || llama_process(context, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            runtime->warm = {};
+            if (stopped(cancel)) break;
             report(error, error_size, "The engine stopped while generating. Try a shorter context or CPU mode.");
             return NL_ERROR;
         }

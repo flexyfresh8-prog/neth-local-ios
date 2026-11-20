@@ -24,6 +24,10 @@ Use **Copy** on a code block or **Copy reply** for the full answer. The sidebar 
 
 Model weights use file-backed memory mapping. The database stores transcripts and incremental excerpts of older turns. **Compact older chat turns** adds a short digest to the prompt. The active attention cache uses device memory.
 
+**Models & context → Prompt checkpoints** controls prompt reuse for text chats with the bundled Qwen model. **RAM + storage** keeps the matching prefix warm during chat, tool planning and continuation. When switching chats or leaving the app, it can save a checkpoint of at least 1,024 prompt tokens. Checkpoints must match the model, runtime configuration and prompt tokens. The app rebuilds the prompt when the checkpoint is missing or incompatible. The device can reclaim these cache files, and deleting a chat also deletes its checkpoints.
+
+Use **Save checkpoint and unload model** to test a restore. After generating in a long chat, unload, then continue the reply or ask a follow-up. The settings show whether that pass used **Storage**, **RAM** or **Rebuilt**, how many tokens it reused, the prefill time, and the time to first token after loading the model. Compare with **RAM only** or **Rebuild every pass**. **Clear saved checkpoints** frees storage used by this cache.
+
 ## Quattro and effort
 
 Enable **Quattro** in the main composer. It can choose tools for calculations, text and data transforms, dates, conversions, and search. The catalog distinguishes general actions from specific unit conversions. Choose an entry in **Quattro tools** to put an editable command in the composer. Use **Web** to send the current query to the search provider.

@@ -9,9 +9,14 @@ struct ModelPanel: View {
     @Binding var thinking: Bool
     @Binding var cache: CachePrecision
     @Binding var compactHistory: Bool
+    @Binding var promptCache: PromptCacheMode
     let active: RuntimeProfile?
+    let metrics: PromptMetrics?
+    let checkpointNotice: String?
     let inferenceBusy: Bool
     let unload: () -> Void
+    let saveAndUnload: () async -> Void
+    let clearCheckpoints: () async -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var showImporter = false
     @State private var removal: URL?
@@ -86,6 +91,33 @@ struct ModelPanel: View {
                     }
                 }
                 .disabled(inferenceBusy)
+
+                Section {
+                    Picker("Prompt reuse", selection: $promptCache) {
+                        ForEach(PromptCacheMode.allCases) { mode in Text(mode.title).tag(mode) }
+                    }
+                    .disabled(inferenceBusy || models.current?.isPreset != true)
+                    if let metrics {
+                        LabeledContent("Last prompt", value: metrics.source)
+                        LabeledContent("Tokens reused", value: "\(metrics.reused.formatted()) / \(metrics.tokens.formatted())")
+                        LabeledContent("Prefill", value: String(format: "%.2f s", metrics.prefill))
+                        if let first = metrics.firstToken {
+                            LabeledContent("First token after model load", value: String(format: "%.2f s", first))
+                        }
+                        if metrics.headroom > 0 {
+                            LabeledContent("Memory available after prefill", value: LocalModels.size(metrics.headroom))
+                        }
+                    }
+                    if promptCache == .storage {
+                        Button("Save checkpoint and unload model") { Task { await saveAndUnload() } }
+                            .disabled(inferenceBusy || active == nil || models.current?.isPreset != true)
+                    }
+                    Button("Clear saved checkpoints", role: .destructive) { Task { await clearCheckpoints() } }
+                        .disabled(inferenceBusy)
+                    if let checkpointNotice { Text(checkpointNotice).font(.footnote).foregroundStyle(.secondary) }
+                } header: { Text("Prompt checkpoints") } footer: {
+                    Text("Bundled Qwen text chats can reuse matching prompts. Storage mode saves longer prompts when you switch chats or leave the app. Saved checkpoints use up to 1.5 GiB of storage.")
+                }
             }
             .navigationTitle("Models")
             .navigationBarTitleDisplayMode(.inline)

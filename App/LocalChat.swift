@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 @MainActor
 final class LocalChat: ObservableObject {
@@ -13,6 +14,8 @@ final class LocalChat: ObservableObject {
     @Published private(set) var activeEffort: EffortPreset?
     @Published private(set) var activeReplyID: Int64?
     @Published private(set) var profile: RuntimeProfile?
+    @Published private(set) var promptMetrics: PromptMetrics?
+    @Published private(set) var checkpointNotice: String?
     @Published private(set) var tokensPerSecond: Double?
     @Published private(set) var hasEarlier = false
     @Published private(set) var hasLater = false
@@ -44,6 +47,7 @@ final class LocalChat: ObservableObject {
 
     func newChat() {
         guard !running, !opening else { return }
+        engine.selectConversation(nil)
         conversationID = nil
         messages = []
         hasEarlier = false
@@ -51,6 +55,8 @@ final class LocalChat: ObservableObject {
         targetMessage = nil
         activity = nil
         tokensPerSecond = nil
+        promptMetrics = nil
+        checkpointNotice = nil
     }
 
     func remove(_ conversation: Conversation) async {
@@ -59,6 +65,7 @@ final class LocalChat: ObservableObject {
         defer { opening = false }
         do {
             try await archive.delete(conversation.id)
+            engine.removeConversation(conversation.id)
             await workspace.remove(conversation: conversation.id)
             if conversationID == conversation.id {
                 conversationID = nil
@@ -68,6 +75,9 @@ final class LocalChat: ObservableObject {
                 targetMessage = nil
                 activity = nil
                 tokensPerSecond = nil
+                promptMetrics = nil
+                checkpointNotice = nil
+                profile = nil
             }
             conversations = try await archive.conversations()
         } catch { problem = error.localizedDescription }
@@ -82,6 +92,11 @@ final class LocalChat: ObservableObject {
             let later: Bool
             if let message { later = try await archive.hasNewer(in: id, than: message) }
             else { later = false }
+            if conversationID != id {
+                engine.selectConversation(id)
+                promptMetrics = nil
+                checkpointNotice = nil
+            }
             conversationID = id
             messages = Array(page.suffix(pageSize))
             hasEarlier = page.count > pageSize
@@ -169,6 +184,8 @@ final class LocalChat: ObservableObject {
         activeEffort = effort
         running = true
         tokensPerSecond = nil
+        promptMetrics = nil
+        checkpointNotice = nil
         setActivity("Preparing", step: 0, total: 0)
         run = Task {
             defer {
@@ -214,7 +231,9 @@ final class LocalChat: ObservableObject {
                     settings: runSettings, report: { self.setActivity($0, step: $1, total: $2) },
                     stream: { request, receive in
                         guard let settings else { throw LocalError(message: "Download a model to use Quattro for this task.") }
-                        return try await self.readStream(request, settings: settings, stop: stop, keepActivity: true, receive: receive)
+                        let planning = self.planningRequest(request, history: history, settings: settings)
+                        return try await self.readStream(planning, in: id, settings: settings, stop: stop,
+                                                         keepActivity: true, receive: receive)
                     }, checkpoint: { snapshot, flush in
                         self.present(snapshot)
                         if flush { try await self.archive.updateReply(snapshot, in: id) }
@@ -258,6 +277,19 @@ final class LocalChat: ObservableObject {
         return try? await archive.compact(in: id, before: cutoff)
     }
 
+    private func planningRequest(_ request: ModelRequest, history: [ChatMessage], settings: EngineSettings) -> ModelRequest {
+        let context = min(settings.context, profile?.context ?? 2048)
+        guard settings.model.isPreset, context >= 2048, request.grammar != nil,
+              request.history.count == 1, let prompt = request.history.first?.text,
+              let task = history.last, !history.contains(where: { $0.photo != nil }),
+              task.text.utf8.count + prompt.utf8.count < context * 2 else { return request }
+        var planning = request
+        planning.history = history
+        planning.instructions = prompt.replacingOccurrences(of: "<|", with: "‹|")
+                                      .replacingOccurrences(of: "\0", with: "")
+        return planning
+    }
+
     private func writeReply(_ reply: inout ChatMessage, history: [ChatMessage], recall: [TranscriptMatch],
                             digest: ContextDigest?, id: String, settings: EngineSettings,
                             effort: EffortPreset, stop: GenerationStop, resuming: Bool) async throws {
@@ -283,7 +315,8 @@ final class LocalChat: ObservableObject {
             var segment = ""
             var segmentFinish: ReplyFinish
             do {
-                segmentFinish = try await readStream(request, settings: settings, stop: stop, keepActivity: continuing) { chunk in
+                segmentFinish = try await readStream(request, in: id, settings: settings, stop: stop,
+                                                     keepActivity: continuing) { chunk in
                     segment += chunk
                     let now = Date()
                     if now.timeIntervalSince(lastPaint) >= 0.07 {
@@ -314,11 +347,11 @@ final class LocalChat: ObservableObject {
         }
     }
 
-    private func readStream(_ request: ModelRequest, settings: EngineSettings, stop: GenerationStop,
+    private func readStream(_ request: ModelRequest, in id: String, settings: EngineSettings, stop: GenerationStop,
                             keepActivity: Bool, receive: (String) async throws -> Void) async throws -> ReplyFinish {
         var finish: ReplyFinish = .stopped
         var received = false
-        for try await event in engine.stream(request, settings: settings, stop: stop) {
+        for try await event in engine.stream(request, in: id, settings: settings, stop: stop) {
             switch event {
             case .loading(let backend):
                 profile = nil
@@ -330,6 +363,8 @@ final class LocalChat: ObservableObject {
                 if activity == "Reasoning" && part.contains("</think>") { activity = "Writing reply" }
                 received = true
                 try await receive(part)
+            case .prompt(let metrics):
+                promptMetrics = metrics
             case .finished(let reason, let count, let seconds):
                 if count > 1 { tokensPerSecond = Double(count - 1) / seconds }
                 finish = reason
@@ -366,6 +401,45 @@ final class LocalChat: ObservableObject {
         stop()
         engine.unload()
         profile = nil
+    }
+
+    func saveAndUnload() async {
+        guard !running, !opening else { return }
+        opening = true
+        defer { opening = false }
+        let saved = await engine.saveAndUnload()
+        profile = nil
+        checkpointNotice = saved ? "Checkpoint saved and model unloaded."
+            : "Model unloaded. A checkpoint needs at least 1,024 prompt tokens and enough available memory and storage."
+    }
+
+    func clearPromptCheckpoints() async {
+        guard !running, !opening else { return }
+        opening = true
+        defer { opening = false }
+        checkpointNotice = await engine.clearCheckpoints() ? "Saved checkpoints cleared." : "Couldn't clear saved checkpoints."
+    }
+
+    func setPromptCache(_ mode: PromptCacheMode) {
+        engine.setPromptCache(mode)
+        checkpointNotice = nil
+    }
+
+    func background() {
+        stop()
+        profile = nil
+        let application = UIApplication.shared
+        var task: UIBackgroundTaskIdentifier = .invalid
+        let end: @MainActor () -> Void = {
+            guard task != .invalid else { return }
+            application.endBackgroundTask(task)
+            task = .invalid
+        }
+        task = application.beginBackgroundTask(withName: "Save prompt checkpoint", expirationHandler: end)
+        Task {
+            _ = await engine.saveAndUnload()
+            end()
+        }
     }
 
     private static func activeTurns(_ history: [ChatMessage], context: Int, searchWeb: Bool) -> [ChatMessage] {

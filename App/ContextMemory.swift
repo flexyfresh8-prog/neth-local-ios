@@ -1,5 +1,18 @@
 import Foundation
 
+enum PromptCacheMode: String, CaseIterable, Identifiable, Sendable {
+    case rebuild, memory, storage
+
+    var id: Self { self }
+    var title: String {
+        switch self {
+        case .rebuild: "Rebuild every pass"
+        case .memory: "RAM only"
+        case .storage: "RAM + storage"
+        }
+    }
+}
+
 enum CachePrecision: String, CaseIterable, Identifiable, Codable, Sendable {
     case automatic, q4, q8, full
 

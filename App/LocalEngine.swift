@@ -1,4 +1,3 @@
-import Darwin
 import Foundation
 
 struct EngineSettings: Equatable, Sendable {
@@ -9,6 +8,7 @@ struct EngineSettings: Equatable, Sendable {
     let thinking: Bool
     let cache: CachePrecision
     let compactHistory: Bool
+    let promptCache: PromptCacheMode
 }
 
 struct RuntimeProfile: Equatable, Sendable {
@@ -26,7 +26,30 @@ enum EngineEvent: Sendable {
     case loading(String)
     case ready(RuntimeProfile)
     case text(String)
+    case prompt(PromptMetrics)
     case finished(ReplyFinish, count: Int, seconds: Double)
+}
+
+struct PromptMetrics: Sendable {
+    let source: String
+    let tokens: Int
+    let reused: Int
+    let prefill: Double
+    let firstToken: Double?
+    let headroom: Int64
+
+    init(_ stats: NLPromptStats) {
+        switch stats.source {
+        case Int32(NL_PROMPT_MEMORY): source = "RAM"
+        case Int32(NL_PROMPT_STORAGE): source = "Storage"
+        default: source = "Rebuilt"
+        }
+        tokens = Int(stats.prompt_tokens)
+        reused = Int(stats.reused_tokens)
+        prefill = stats.prefill_ms / 1000
+        firstToken = stats.first_token_ms >= 0 ? stats.first_token_ms / 1000 : nil
+        headroom = Int64(stats.prefill_headroom)
+    }
 }
 
 final class GenerationStop: @unchecked Sendable {
@@ -65,12 +88,50 @@ final class LocalEngine: @unchecked Sendable {
     private var runtime: OpaquePointer?
     private var runtimeKey: RuntimeKey?
     private var usesMetal = false
+    private let checkpoints = PromptCheckpoints()
+    private var activeConversation: String?
+    private var activeCheckpoint: URL?
 
     deinit { if let runtime { nl_close(runtime) } }
 
     func unload() { work.async { self.releaseRuntime() } }
 
-    func stream(_ request: ModelRequest, settings: EngineSettings, stop: GenerationStop)
+    func saveAndUnload() async -> Bool {
+        await withCheckedContinuation { completion in
+            work.async {
+                let saved = self.saveCheckpoint()
+                self.releaseRuntime()
+                completion.resume(returning: saved)
+            }
+        }
+    }
+
+    func selectConversation(_ id: String?) { work.async { self.activateConversation(id) } }
+
+    func removeConversation(_ id: String) {
+        work.async {
+            if self.activeConversation == id {
+                self.releaseRuntime()
+                self.activeConversation = nil
+            }
+            self.checkpoints.remove(conversation: id)
+        }
+    }
+
+    func setPromptCache(_ mode: PromptCacheMode) {
+        work.async {
+            if mode != .storage { self.activeCheckpoint = nil }
+            if mode == .rebuild, let runtime = self.runtime { nl_forget_prompt(runtime) }
+        }
+    }
+
+    func clearCheckpoints() async -> Bool {
+        await withCheckedContinuation { completion in
+            work.async { completion.resume(returning: self.checkpoints.clear()) }
+        }
+    }
+
+    func stream(_ request: ModelRequest, in conversation: String, settings: EngineSettings, stop: GenerationStop)
         -> AsyncThrowingStream<EngineEvent, Error> {
         AsyncThrowingStream { continuation in
             continuation.onTermination = { termination in
@@ -78,6 +139,12 @@ final class LocalEngine: @unchecked Sendable {
             }
             work.async {
                 do {
+                    guard !stop.cancelled else {
+                        continuation.yield(.finished(.stopped, count: 0, seconds: 0))
+                        continuation.finish()
+                        return
+                    }
+                    self.activateConversation(conversation)
                     try self.generate(request, settings: settings, stop: stop, continuation: continuation)
                     continuation.finish()
                 } catch { continuation.finish(throwing: error) }
@@ -89,6 +156,20 @@ final class LocalEngine: @unchecked Sendable {
         if let runtime { nl_close(runtime) }
         runtime = nil
         runtimeKey = nil
+        activeCheckpoint = nil
+    }
+
+    private func saveCheckpoint() -> Bool {
+        guard let runtime, let activeCheckpoint else { return false }
+        return checkpoints.save(runtime, at: activeCheckpoint)
+    }
+
+    private func activateConversation(_ id: String?) {
+        guard activeConversation != id else { return }
+        _ = saveCheckpoint()
+        if let runtime { nl_forget_prompt(runtime) }
+        activeConversation = id
+        activeCheckpoint = nil
     }
 
     private func generate(_ request: ModelRequest, settings: EngineSettings, stop: GenerationStop,
@@ -147,24 +228,36 @@ final class LocalEngine: @unchecked Sendable {
 
             let context = Int(nl_context_window(runtime))
             let cache = nl_context_cache(runtime) == 1 ? "Q4" : nl_context_cache(runtime) == 2 ? "Q8" : "F16"
-            continuation.yield(.ready(RuntimeProfile(backend: backend, context: context, cache: cache)))
+            let profile = RuntimeProfile(backend: backend, context: context, cache: cache)
+            continuation.yield(.ready(profile))
+            let reuse = settings.model.isPreset && !vision && settings.promptCache != .rebuild
+            if reuse, settings.promptCache == .storage, let activeConversation {
+                activeCheckpoint = checkpoints.location(conversation: activeConversation, profile: profile)
+            } else {
+                activeCheckpoint = nil
+            }
             let reference = referenceText(context: context, evidence: request.evidence, recall: request.recall,
                                           digest: request.digest, instructions: request.instructions)
             let referencePointer = strdup(reference)
             let prefix = strdup(ReplyContinuation.tail(of: request.prefix, context: context))
             let grammar = request.grammar.flatMap { strdup($0) }
-            defer { free(referencePointer); free(prefix); free(grammar) }
+            let checkpoint = activeCheckpoint.map { strdup($0.path) } ?? nil
+            defer { free(referencePointer); free(prefix); free(grammar); free(checkpoint) }
             var options = NLGeneration(projector_path: projector.map { UnsafePointer($0) },
                                        reference: referencePointer.map { UnsafePointer($0) },
                                        assistant_prefix: prefix.map { UnsafePointer($0) },
                                        grammar: grammar.map { UnsafePointer($0) },
                                        reasoning_budget: Int32(request.reasoning),
-                                       output_limit: Int32(request.limit))
+                                       output_limit: Int32(request.limit),
+                                       reuse_prompt: reuse,
+                                       checkpoint_path: checkpoint.map { UnsafePointer($0) },
+                                       deterministic: false)
             var generated: Int32 = 0
             var finish: Int32 = 0
+            var stats = NLPromptStats()
             let status = messages.withUnsafeBufferPointer { messages in
                 nl_generate(runtime, messages.baseAddress, messages.count, &options,
-                            stop.handle, receiveChunk, opaque, &generated, &finish, &error, errorLength)
+                            stop.handle, receiveChunk, opaque, &generated, &finish, &stats, &error, errorLength)
             }
             if status == NL_RETRY && metal && generated == 0 {
                 releaseRuntime()
@@ -181,6 +274,10 @@ final class LocalEngine: @unchecked Sendable {
             case Int32(NL_FINISH_CONTEXT): reason = .contextLimit
             case Int32(NL_FINISH_STOPPED): reason = .stopped
             default: reason = .complete
+            }
+            if stats.source == Int32(NL_PROMPT_STORAGE), let activeCheckpoint { checkpoints.touch(activeCheckpoint) }
+            if stats.prompt_tokens > 0, stats.first_token_ms >= 0 || status == NL_OK {
+                continuation.yield(.prompt(PromptMetrics(stats)))
             }
             continuation.yield(.finished(reason, count: Int(generated), seconds: elapsed))
             return
