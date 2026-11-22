@@ -80,12 +80,11 @@ extension CloudSession {
     private func pass(_ request: CloudRequest, profile: RuntimeProfile, model: String?, stop: GenerationStop,
                       continuation: AsyncThrowingStream<EngineEvent, Error>.Continuation,
                       finish: inout ReplyFinish) async throws {
-        var urlRequest = URLRequest(url: server.url.appending(path: CloudEndpoint.chat), timeoutInterval: 75)
+        var urlRequest = URLRequest(url: server.url.appending(path: CloudEndpoint.chat), timeoutInterval: 180)
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("Bearer \(server.token)", forHTTPHeaderField: "Authorization")
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         urlRequest.httpBody = CloudSession.makeBody(request, model: model)
-        urlRequest.timeoutIntervalForResource = 900
 
         let started = Date()
         let (bytes, response) = try await session.bytes(for: urlRequest)
