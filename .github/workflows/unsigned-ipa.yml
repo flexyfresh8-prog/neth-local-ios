@@ -21,7 +21,7 @@ jobs:
           xcrun --sdk macosx swiftc -swift-version 5 -parse-as-library \
             App/ChatArchive.swift App/WebSearch.swift App/ReplyFormat.swift App/ReplyState.swift \
             App/ContextMemory.swift App/QuattroCatalog.swift App/QuattroTools.swift App/QuattroPlan.swift \
-            App/ChatWorkspace.swift App/QuattroAgent.swift scripts/check-chat.swift \
+            App/ChatWorkspace.swift App/QuattroAgent.swift App/NethCloud.swift scripts/check-chat.swift \
             -lsqlite3 -o "$RUNNER_TEMP/check-chat"
           "$RUNNER_TEMP/check-chat"
       - name: Build and verify iPad packages
@@ -35,6 +35,23 @@ jobs:
             out/NethLocal.entitlements
           if-no-files-found: error
           compression-level: 0
+  cloud-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: python -m pip install pytest requests
+      - name: Fetch llama.cpp server and fixture model
+        run: python tests/fetch_fixture.py --dest tests/fixtures
+      - name: Run cloud contract tests
+        run: python -m pytest tests/test_cloud_contract.py -v
+
   windows:
     runs-on: windows-2022
     timeout-minutes: 30

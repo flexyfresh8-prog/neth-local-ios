@@ -6,3 +6,6 @@ Windows/obj/
 scripts/check-windows-peer/bin/
 scripts/check-windows-peer/obj/
 __pycache__/
+tests/fixtures/
+tests/.cache/
+tests/bench-server.log

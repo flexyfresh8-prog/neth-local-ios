@@ -10,6 +10,7 @@ struct EngineSettings: Equatable, Sendable {
     let compactHistory: Bool
     let promptCache: PromptCacheMode
     let windows: WindowsCompute?
+    let cloud: CloudCompute?
 }
 
 struct RuntimeProfile: Equatable, Sendable {
@@ -147,8 +148,22 @@ final class LocalEngine: @unchecked Sendable {
     func stream(_ request: ModelRequest, in conversation: String, settings: EngineSettings, stop: GenerationStop)
         -> AsyncThrowingStream<EngineEvent, Error> {
         AsyncThrowingStream { continuation in
+            var forwarding: Task<Void, Never>?
             continuation.onTermination = { termination in
-                if case .cancelled = termination { stop.request() }
+                if case .cancelled = termination {
+                    stop.request()
+                    forwarding?.cancel()
+                }
+            }
+            if let cloud = settings.cloud {
+                let remote = CloudGeneration.run(request, cloud: cloud, stop: stop)
+                forwarding = Task {
+                    do {
+                        for try await event in remote { continuation.yield(event) }
+                        continuation.finish()
+                    } catch { continuation.finish(throwing: error) }
+                }
+                return
             }
             work.async {
                 do {
@@ -277,8 +292,8 @@ final class LocalEngine: @unchecked Sendable {
             } else {
                 activeCheckpoint = nil
             }
-            let reference = referenceText(context: context, evidence: request.evidence, recall: request.recall,
-                                          digest: request.digest, instructions: request.instructions)
+            let reference = Self.referenceText(context: context, evidence: request.evidence, recall: request.recall,
+                                               digest: request.digest, instructions: request.instructions)
             let referencePointer = strdup(reference)
             let prefix = strdup(ReplyContinuation.tail(of: request.prefix, context: context))
             let grammar = request.grammar.flatMap { strdup($0) }
@@ -328,8 +343,8 @@ final class LocalEngine: @unchecked Sendable {
         }
     }
 
-    private func referenceText(context: Int, evidence: WebEvidence?, recall: [TranscriptMatch], digest: ContextDigest?,
-                               instructions: String) -> String {
+    static func referenceText(context: Int, evidence: WebEvidence?, recall: [TranscriptMatch], digest: ContextDigest?,
+                              instructions: String) -> String {
         var sections: [String] = []
         if !instructions.isEmpty { sections.append(instructions) }
         func excerpt(_ text: String, limit: Int) -> String {

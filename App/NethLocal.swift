@@ -33,6 +33,7 @@ private struct ChatScreen: View {
 
     @StateObject private var models = LocalModels()
     @StateObject private var windows = WindowsDevices()
+    @StateObject private var cloud = NethCloud()
     @StateObject private var chat = LocalChat()
     @AppStorage("contextSize") private var context = 4096
     @AppStorage("cpuOnly") private var cpuOnly = false
@@ -63,10 +64,13 @@ private struct ChatScreen: View {
     private let readingWidth: CGFloat = 756
     private let composerWidth: CGFloat = 680
 
-    private var canAttach: Bool { models.current?.isPreset == true && models.projector != nil && windows.compute == nil }
+    private var canAttach: Bool {
+        models.current?.isPreset == true && models.projector != nil
+            && windows.compute == nil && cloud.compute == nil
+    }
     private var busy: Bool { chat.running || chat.opening }
     private var canSend: Bool {
-        !busy && !loadingPhoto && (models.current != nil || quattro)
+        !busy && !loadingPhoto && (models.current != nil || quattro || cloud.compute != nil)
             && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || photo != nil)
     }
 
@@ -111,7 +115,7 @@ private struct ChatScreen: View {
                 }
                 .presentationDetents([.large])
             case .models:
-                ModelPanel(models: models, windows: windows, context: $context, cpuOnly: $cpuOnly,
+                ModelPanel(models: models, windows: windows, cloud: cloud, context: $context, cpuOnly: $cpuOnly,
                            thinking: $thinking, cache: $cache, compactHistory: $compactHistory,
                            promptCache: $promptCache, active: chat.profile, metrics: chat.promptMetrics,
                            checkpointNotice: chat.checkpointNotice, inferenceBusy: busy,
@@ -167,6 +171,10 @@ private struct ChatScreen: View {
             if !canAttach { clearAttachment() }
         }
         .onChange(of: windows.compute) { _, _ in
+            chat.unload()
+            if !canAttach { clearAttachment() }
+        }
+        .onChange(of: cloud.selectedID) { _, _ in
             chat.unload()
             if !canAttach { clearAttachment() }
         }
@@ -460,7 +468,7 @@ private struct ChatScreen: View {
 
     @ViewBuilder
     private var quickActions: some View {
-        quickAction("Draft a note", symbol: "doc.badge.plus", available: models.current != nil) {
+        quickAction("Draft a note", symbol: "doc.badge.plus", available: models.current != nil || cloud.compute != nil) {
             quattro = true
             makeFiles = true
             if draft.isEmpty { draft = "/file Notes.md " }
@@ -628,13 +636,13 @@ private struct ChatScreen: View {
                     .padding(.horizontal, 7)
                     .transition(reduceMotion ? .identity : NethMotion.panel)
                 }
-                TextField(models.current == nil && !quattro ? "Choose a model to start" : quattro ? "Give Quattro a task" : "Describe a task or ask a question",
+                TextField(composerPlaceholder,
                           text: $draft, axis: .vertical)
                     .font(.body)
                     .textFieldStyle(.plain)
                     .lineLimit(1...maxLines)
                     .focused($typing)
-                    .disabled(models.current == nil && !quattro)
+                    .disabled(models.current == nil && !quattro && cloud.compute == nil)
                     .padding(.horizontal, 8)
                     .padding(.top, 7)
                     .frame(minHeight: maxLines <= 3 ? 36 : 51, alignment: .topLeading)
@@ -742,7 +750,15 @@ private struct ChatScreen: View {
 
     @ViewBuilder
     private var modelSelector: some View {
-        if models.installed.isEmpty {
+        if let compute = cloud.compute {
+            Button { togglePicker(.model) } label: {
+                selectorLabel("GPT-OSS 20B · Cloud", symbol: "icloud", expanded: expandedPicker == .model)
+            }
+            .buttonStyle(NethPress())
+            .accessibilityLabel("Model")
+            .accessibilityValue("Neth Cloud GPU")
+            .accessibilityAddTraits(expandedPicker == .model ? .isSelected : [])
+        } else if models.installed.isEmpty {
             Button { sheet = .models } label: {
                 selectorLabel("Choose a model", symbol: "cpu", trailing: "arrow.up.right")
             }
@@ -840,6 +856,13 @@ private struct ChatScreen: View {
         .contentShape(Rectangle())
     }
 
+    private var composerPlaceholder: String {
+        if models.current == nil && !quattro {
+            return cloud.compute == nil ? "Choose a model to start" : "Ask GPT-OSS 20B on Neth Cloud"
+        }
+        return quattro ? "Give Quattro a task" : "Describe a task or ask a question"
+    }
+
     private var sendControl: some View {
         let enabled = chat.running || canSend
         return Button {
@@ -887,12 +910,22 @@ private struct ChatScreen: View {
     }
 
     private var engineSettings: EngineSettings? {
+        if let compute = cloud.compute {
+            return EngineSettings(model: Self.cloudModel, projector: nil, context: compute.context, cpuOnly: false,
+                                  thinking: thinking, cache: cache, compactHistory: compactHistory,
+                                  promptCache: promptCache, windows: nil, cloud: compute)
+        }
         guard let model = models.current else { return nil }
         return EngineSettings(model: model, projector: canAttach ? models.projector : nil,
                               context: context, cpuOnly: cpuOnly, thinking: thinking,
                               cache: cache, compactHistory: compactHistory, promptCache: promptCache,
-                              windows: model.isPreset ? windows.compute : nil)
+                              windows: model.isPreset ? windows.compute : nil, cloud: nil)
     }
+
+    private static let cloudModel = InstalledModel(
+        title: "GPT-OSS 20B · Cloud",
+        url: URL(fileURLWithPath: "/NethCloud/GPT-OSS-20B-Uncensored-HauhauCS-MXFP4-Aggressive.gguf"),
+        bytes: 12_109_565_888, isPreset: false)
 
     private func continueReply(_ reply: ChatMessage) {
         typing = false

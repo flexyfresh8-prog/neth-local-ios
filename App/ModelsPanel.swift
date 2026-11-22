@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 struct ModelPanel: View {
     @ObservedObject var models: LocalModels
     @ObservedObject var windows: WindowsDevices
+    @ObservedObject var cloud: NethCloud
     @Binding var context: Int
     @Binding var cpuOnly: Bool
     @Binding var thinking: Bool
@@ -21,6 +22,7 @@ struct ModelPanel: View {
     @Environment(\.dismiss) private var dismiss
     @State private var showImporter = false
     @State private var showWindowsPairing = false
+    @State private var showCloudPairing = false
     @State private var windowsProblem: String?
     @State private var removal: URL?
     @State private var available = Int64(nl_available_memory())
@@ -41,6 +43,12 @@ struct ModelPanel: View {
                         windows.choose(peer)
                     }
                     showWindowsPairing = false
+                }
+            }
+            .navigationDestination(isPresented: $showCloudPairing) {
+                CloudPairingPanel(cloud: cloud) { _ in
+                    if cloud.status.connected { windows.choose(nil) }
+                    showCloudPairing = false
                 }
             }
         }
@@ -71,8 +79,10 @@ struct ModelPanel: View {
 
     private var settingsList: some View {
         List {
-            WindowsComputeSection(devices: windows, hasModel: models.has(.qwen), busy: inferenceBusy,
-                                  chooseModel: selectBundledModel, pair: { showWindowsPairing = true },
+            CloudComputeSection(cloud: cloud, windowsLinked: windows.compute != nil, busy: inferenceBusy,
+                                pair: { showCloudPairing = true }, report: { windowsProblem = $0 })
+            WindowsComputeSection(devices: windows, hasModel: models.has(.qwen), cloudLinked: cloud.compute != nil,
+                                  busy: inferenceBusy, chooseModel: selectBundledModel, pair: { showWindowsPairing = true },
                                   report: { windowsProblem = $0 })
             Section {
                 assetRow(.qwen, detail: "HauhauCS · Q4_K_M · \(LocalModels.size(ModelAsset.qwen.bytes))")

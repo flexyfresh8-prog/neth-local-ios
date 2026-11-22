@@ -1,6 +1,6 @@
 # Neth Local
 
-Neth Local runs GGUF models on the iPad with llama.cpp. It downloads the HauhauCS Qwen3.5 4B Uncensored Q4_K_M checkpoint and an optional vision projector from Hugging Face. Both downloads are pinned to a specific revision and checked by SHA-256 before installation. The app supports local inference and shared text inference with a paired Windows computer.
+Neth Local runs GGUF models on the iPad with llama.cpp. It downloads the HauhauCS Qwen3.5 4B Uncensored Q4_K_M checkpoint and an optional vision projector from Hugging Face. Both downloads are pinned to a specific revision and checked by SHA-256 before installation. The app supports local inference, shared text inference with a paired Windows computer, and remote inference on a cloud GPU (Neth Cloud, new in v3.7.0).
 
 ## Build
 
@@ -24,6 +24,10 @@ Use **Import GGUF** to add other decoder models with a llama.cpp-supported archi
 4. Select the Windows computer and send a text prompt. **Layers on Windows** controls how many of the first 32 Qwen layers run on the laptop CPU. The iPad runs the remaining layers and samples the response. Check the composer for the measured token rate and use **This iPad** for a local comparison.
 
 Both devices read their own copy of the same model. The shared link carries token IDs and intermediate activations over TLS. The iPad verifies the certificate from the pairing code. Treat the QR code and the copied pairing code as credentials. Shared mode supports text and up to 32K context. Local mode supports photos and prompt checkpoints. The Windows companion uses an AVX2-capable x64 CPU. Single-reply speed depends on the two devices and network latency.
+
+## Send replies to Neth Cloud GPU
+
+Run **NethCloud_GPTOSS20B_Aggressive.ipynb** (in `colab/`) on a Google Colab T4 or any GPU host. The notebook serves **GPT-OSS-20B-Uncensored-HauhauCS-Aggressive** (MXFP4 GGUF, 12.1 GB) with llama.cpp's OpenAI-compatible server, verifies the GPU, the download and the API key, and prints a `NETHCLOUD1.` connect code after every session start. In the app, open **Models & context → Neth Cloud GPU → Add cloud server** and paste the code: the server is stored in the keychain, the connection is health-checked, and the composer shows **GPT-OSS 20B · Cloud**. Streaming, reasoning-channel replies, effort levels and the Quattro tool agent all work over the cloud backend, and conversation history survives backend switches. Free Colab runtimes are interactive test environments — they sleep and disconnect on Google's schedule, and each new session prints a fresh code; see [Neth Cloud setup and troubleshooting](docs/NETH_CLOUD.md).
 
 ## Search, copy and history
 

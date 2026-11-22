@@ -130,13 +130,14 @@ struct ChatChecks {
         precondition(!QuattroPlan.looksComplete("{\"a\": ", path: "data.json"))
         try await checkQuattro(tools)
         try await checkLegacy(root)
+        try checkCloud()
         if CommandLine.arguments.count == 2 {
             let directory = URL(fileURLWithPath: CommandLine.arguments[1])
             let calculator = catalog["math.calculate"]!
             try QuattroPlan.toolGrammar([calculator]).write(to: directory.appending(path: "tool.gbnf"), atomically: true, encoding: .utf8)
             try QuattroPlan.projectGrammar.write(to: directory.appending(path: "project.gbnf"), atomically: true, encoding: .utf8)
         }
-        print("Checked reply continuation, migration, compression, web parsers, files and \(catalog.tools.count) callable tools.")
+        print("Checked reply continuation, migration, compression, web parsers, files, \(catalog.tools.count) callable tools and the Neth Cloud connect layer.")
     }
 
     private static func checkFileRouting() throws {
@@ -212,6 +213,69 @@ struct ChatChecks {
             }, checkpoint: { _, _ in })
         guard case .answer = passed else { preconditionFailure("Quattro did not pass its tool result back to chat.") }
         precondition(calls == 2 && result.metadata?.trace.first?.detail.contains("28.274333882") == true)
+    }
+
+    private static func checkCloud() throws {
+        let server = CloudServer(name: "Colab T4",
+                                 url: URL(string: "https://neth-test.trycloudflare.com")!,
+                                 token: "nl-session-key-123456", model: "gpt-oss-20b")
+        precondition(server.isValid && server.id.count == 24)
+        let parsed = try CloudServer.parse(server.pairingCode)
+        precondition(parsed == server)
+        do {
+            _ = try CloudServer.parse("NETHCLOUD1.not-a-code")
+            preconditionFailure("Invalid cloud code was accepted")
+        } catch is LocalError {}
+        do {
+            _ = try CloudServer.parse("NETH36.ignored-windows-code")
+            preconditionFailure("Windows pairing code was accepted as a cloud code")
+        } catch is LocalError {}
+        let loopback = CloudServer(name: "Dev", url: URL(string: "http://127.0.0.1:8080")!,
+                                   token: "nl-session-key-123456", model: "m")
+        precondition(loopback.isValid)
+        let plainHTTP = CloudServer(name: "Insecure", url: URL(string: "http://10.0.0.5:8080")!,
+                                    token: "nl-session-key-123456", model: "m")
+        precondition(!plainHTTP.isValid)
+        let emptyToken = CloudServer(name: "Empty", url: server.url, token: "short", model: "m")
+        precondition(!emptyToken.isValid)
+
+        let content = HarmonyAdapter.parseChunk(#"{"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}"#)
+        precondition(content?.content == "Hi" && content?.reasoning == nil && content?.finish == nil)
+        let reasoning = HarmonyAdapter.parseChunk(#"{"choices":[{"delta":{"reasoning_content":"plan"}}]}"#)
+        precondition(reasoning?.reasoning == "plan" && reasoning?.content == nil)
+        let roleOnly = HarmonyAdapter.parseChunk(#"{"choices":[{"delta":{"role":"assistant"}}]}"#)
+        precondition(roleOnly?.content == nil && roleOnly?.reasoning == nil && roleOnly?.finish == nil)
+        let usage = HarmonyAdapter.parseChunk(
+            #"{"choices":[{"delta":{},"finish_reason":"length"}],"usage":{"completion_tokens":42}}"#)
+        precondition(usage?.finish == "length" && usage?.completionTokens == 42)
+        let serverError = HarmonyAdapter.parseChunk(#"{"error":{"message":"CUDA out of memory"}}"#)
+        precondition(serverError?.detail == "CUDA out of memory")
+        let nameCall = HarmonyAdapter.parseChunk(
+            #"{"choices":[{"delta":{"tool_calls":[{"index":3,"function":{"name":"math.add"}}]}}]}"#)
+        precondition(nameCall?.toolIndex == 3 && nameCall?.toolName == "math.add")
+        let fragmentCall = HarmonyAdapter.parseChunk(
+            #"{"choices":[{"delta":{"tool_calls":[{"index":3,"function":{"arguments":"{\"a\":"}}]}}]}"#)
+        precondition(fragmentCall?.toolArguments == "{\"a\":")
+
+        let body = try JSONSerialization.jsonObject(with: CloudSession.makeBody(
+            CloudRequest(system: "sys", turns: [.init(role: .user, text: "q")], prefix: "part",
+                         grammar: "root", limit: 300, reasoningEffort: "medium"),
+            model: "gpt-oss-20b")) as! [String: Any]
+        let messages = body["messages"] as! [[String: String]]
+        precondition(messages.count == 3)
+        precondition(messages[0]["role"] == "system" && messages[0]["content"] == "sys")
+        precondition(messages[1]["role"] == "user" && messages[1]["content"] == "q")
+        precondition(messages[2]["role"] == "assistant" && messages[2]["content"] == "part")
+        precondition(body["grammar"] as? String == "root" && body["max_tokens"] as? Int == 300)
+        precondition(body["stream"] as? Bool == true && body["cache_prompt"] as? Bool == true)
+        precondition((body["chat_template_kwargs"] as? [String: Any])?["reasoning_effort"] as? String == "medium")
+        precondition((body["stream_options"] as? [String: Any])?["include_usage"] as? Bool == true)
+        let plain = try JSONSerialization.jsonObject(with: CloudSession.makeBody(
+            CloudRequest(system: "", turns: [CloudTurn(role: .assistant, text: "<think>plan</think>\n\nVisible")]),
+            model: nil)) as! [String: Any]
+        let plainMessages = plain["messages"] as! [[String: String]]
+        precondition(plainMessages.count == 1 && plainMessages[0]["content"] == "Visible")
+        precondition((plain["model"] as? String) == nil && plain["grammar"] == nil)
     }
 
     private static func checkLegacy(_ root: URL) async throws {

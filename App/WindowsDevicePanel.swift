@@ -7,6 +7,7 @@ import VisionKit
 struct WindowsComputeSection: View {
     @ObservedObject var devices: WindowsDevices
     let hasModel: Bool
+    let cloudLinked: Bool
     let busy: Bool
     let chooseModel: () -> Void
     let pair: () -> Void
@@ -45,14 +46,16 @@ struct WindowsComputeSection: View {
         } header: {
             Text("Compute device")
         } footer: {
-            if !hasModel {
+            if cloudLinked {
+                Text("Disconnect the Neth Cloud GPU server to share inference with a paired Windows computer.")
+            } else if !hasModel {
                 Text("Download the bundled Qwen3.5 4B on both devices to share inference.")
             } else if devices.compute != nil {
                 Text("Both devices run one Qwen3.5 4B reply. Shared compute supports text and up to 32K context. Prompt checkpoints are available on This iPad.")
             }
         }
         .listRowBackground(NethPalette.surface)
-        .disabled(busy)
+        .disabled(busy || cloudLinked)
     }
 
     private func deviceRow(_ name: String, detail: String, icon: String, selected: Bool) -> some View {

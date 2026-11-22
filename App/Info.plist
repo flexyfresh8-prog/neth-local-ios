@@ -9,8 +9,8 @@
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
     <key>CFBundleName</key><string>NethLocal</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>3.6.1</string>
-    <key>CFBundleVersion</key><string>10</string>
+    <key>CFBundleShortVersionString</key><string>3.7.0</string>
+    <key>CFBundleVersion</key><string>11</string>
     <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
     <key>MinimumOSVersion</key><string>18.0</string>
     <key>NSLocalNetworkUsageDescription</key><string>Connect to your paired Windows computer over its 5 GHz Mobile Hotspot for shared inference.</string>
