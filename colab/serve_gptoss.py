@@ -256,7 +256,8 @@ def _wait_health(port: int, api_key: str, deadline: float, log) -> None:
 
 
 def serve(model: Path | None, server: Path | None, port: int, context: int, api_key: str,
-          flash_attn: str = "on", threads: int = 0) -> None:
+          flash_attn: str = "on", threads: int = 0, ngl: int = 999, batch: int = 2048,
+          ubatch: int = 512, kv_cache: str = "f16") -> None:
     BASE_DIR.mkdir(parents=True, exist_ok=True)
     model = model or local_model_path() or fail("No model file; run the download cell first.")
     server = server or discover()
@@ -264,8 +265,10 @@ def serve(model: Path | None, server: Path | None, port: int, context: int, api_
     attempts = [flash_attn, "off"] if flash_attn != "off" else ["off"]
     for attempt in attempts:
         command = [str(server), "-m", str(model), "--host", "127.0.0.1", "--port", str(port),
-                   "-ngl", "999", "-c", str(context), "--jinja", "--api-key", api_key,
-                   "-b", "2048", "-ub", "512", "-t", str(threads)]
+                   "-ngl", str(ngl), "-c", str(context), "--jinja", "--api-key", api_key,
+                   "-b", str(batch), "-ub", str(ubatch), "-t", str(threads)]
+        if kv_cache != "f16":
+            command += ["-ctk", kv_cache, "-ctv", kv_cache]
         if attempt != "off":
             command += ["--flash-attn", attempt]
         say(f"Launching: {' '.join(command[:-1])} ***")
@@ -514,6 +517,11 @@ def main() -> None:
     parser.add_argument("--context", type=int, default=2048)
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--flash-attn", default="on", choices=["on", "off"])
+    parser.add_argument("--ngl", type=int, default=999, help="GPU layers to offload (999 = all)")
+    parser.add_argument("--batch", type=int, default=2048)
+    parser.add_argument("--ubatch", type=int, default=512)
+    parser.add_argument("--kv-cache", default="f16", choices=["f16", "q8_0", "q4_0"],
+                        help="KV cache precision (-ctk/-ctv); q8_0 doubles the affordable context")
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--name", default="Neth Cloud T4")
     parser.add_argument("--deep-hash", action="store_true")
@@ -536,7 +544,8 @@ def main() -> None:
             api_key = "nl-" + base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
             say(f"Generated session API key: {api_key}")
         serve(args.model, args.server, args.port, args.context, api_key,
-              flash_attn=args.flash_attn, threads=args.threads)
+              flash_attn=args.flash_attn, threads=args.threads, ngl=args.ngl,
+              batch=args.batch, ubatch=args.ubatch, kv_cache=args.kv_cache)
     elif args.command == "health":
         health()
     elif args.command == "stream":
