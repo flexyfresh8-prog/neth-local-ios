@@ -315,7 +315,7 @@ final class NethCloud: ObservableObject {
 
 final class CloudSession: @unchecked Sendable {
     let server: CloudServer
-    private let session: URLSession
+    let session: URLSession
 
     init(server: CloudServer) {
         self.server = server
@@ -360,7 +360,7 @@ final class CloudSession: @unchecked Sendable {
         return LocalError(message: error.localizedDescription)
     }
 
-    private static func statusMessage(_ status: Int, body: String) -> LocalError {
+    static func statusMessage(_ status: Int, body: String) -> LocalError {
         switch status {
         case 401, 403:
             return LocalError(message: "The server rejected the API key. Paste a fresh connect code from the notebook.")
