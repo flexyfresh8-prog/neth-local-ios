@@ -41,10 +41,17 @@ struct CloudComputeSection: View {
             }
             if let compute = cloud.compute {
                 LabeledContent("Model", value: compute.server.model.isEmpty ? "Server default" : compute.server.model)
+                LabeledContent("Server window",
+                               value: cloud.serverContext.map { "\($0.formatted()) tokens" } ?? "Unknown")
                 Picker("Context", selection: $cloud.context) {
                     ForEach(CloudCompute.contexts, id: \.self) { tokens in
                         Text("\(tokens.formatted()) tokens").tag(tokens)
                     }
+                }
+                if let window = cloud.serverContext, cloud.context > window {
+                    Text("Requests use the server's \(window.formatted())-token window. Run the notebook with a larger context to raise it.")
+                        .font(.caption)
+                        .foregroundStyle(NethPalette.muted)
                 }
                 connectionDetails
                 Button("Disconnect", role: .destructive) { cloud.disconnect() }

@@ -45,6 +45,9 @@ LOG_FILE = BASE_DIR / "llama-server.log"
 BIN_DIRS = [Path("/content/llama-prebuilt"), Path("/content/llama.cpp"), Path("/content")]
 MODEL_SEARCH_DIRS = [BASE_DIR, Path("/content"), Path("/root/.cache/huggingface")]
 KV_BYTES_PER_TOKEN = 49_152          # gpt-oss-20b: 24 layers, 8 KV heads, head 64, f16
+CONTEXT_LADDER = [32768, 24576, 16384, 12288, 10240, 8192, 6144, 4096]
+CONTEXT_PROMISE = 10_240           # v3.8.2: smallest window auto mode still calls "10k+ working"
+KV_AUTOSWITCH = 8_192              # windows at/above this default to the q8_0 KV cache
 VRAM_OVERHEAD_BYTES = 1_600_000_000  # CUDA context, activations, compute buffers
 
 
@@ -139,7 +142,7 @@ def _download(url: str, dest: Path) -> None:
         say(f"Already present: {dest.name} ({dest.stat().st_size:,} bytes)")
         return
     partial = dest.with_suffix(dest.suffix + ".part")
-    headers = {"User-Agent": "neth-local-colab/3.7.0"}
+    headers = {"User-Agent": "neth-local-colab/3.8.2"}
     offset = 0
     if partial.exists():
         offset = partial.stat().st_size
@@ -400,42 +403,96 @@ def _wait_health(port: int, api_key: str, deadline: float, log) -> None:
     fail("Timed out waiting for /health. Inspect /content/nethcloud/llama-server.log.")
 
 
+def _looks_like_oom(tail: str) -> bool:
+    low = tail.lower()
+    return any(marker in low for marker in ("out of memory", "oom", "failed to allocate",
+                                            "cudamalloc", "no available memory",
+                                            "ggml_backend_alloc", "cuda error"))
+
+
+def context_candidates(requested: int, budget: int | None) -> list[tuple[int, str]]:
+    """(context, origin) attempts, largest first. requested <= 0 = auto for this GPU."""
+    if requested and requested > 0:
+        return [(requested, "explicit --context")]
+    pool = [c for c in CONTEXT_LADDER if c <= 16_384]
+    if budget:
+        affordable = [c for c in pool if KV_BYTES_PER_TOKEN * c * 1.15 <= budget]
+        if affordable:
+            pool = [c for c in pool if c <= max(affordable)]
+        else:
+            pool = [4_096]
+            say("  VRAM budget suggests even 10,240 tokens may not fit; starting small.")
+    return [(c, "auto") for c in pool]
+
+
 def serve(model: Path | None, server: Path | None, port: int, context: int, api_key: str,
           flash_attn: str = "on", threads: int = 0, ngl: int = 999, batch: int = 2048,
-          ubatch: int = 512, kv_cache: str = "f16") -> None:
+          ubatch: int = 512, kv_cache: str | None = None) -> None:
+    """Launch llama-server with v3.8.2 context negotiation.
+
+    context <= 0 (auto) picks the largest CONTEXT_LADDER window the GPU's VRAM
+    budget suggests and falls back to smaller windows when llama-server dies with
+    an out-of-memory log; 10,240 tokens is the promised floor and anything below
+    it is reported loudly. kv_cache=None selects q8_0 automatically for windows
+    >= KV_AUTOSWITCH, halving the KV cache so 10k+ fits on a T4."""
     BASE_DIR.mkdir(parents=True, exist_ok=True)
-    model = model or local_model_path() or fail("No model file; run the download cell first.")
+    model = model or local_model_path() or fail("No model file; rerun this cell — the download step handles it.")
     server = server or discover()
     threads = threads or max(2, (os.cpu_count() or 4) - 1)
     port = _choose_port(port)
-    attempts = [flash_attn, "off"] if flash_attn != "off" else ["off"]
-    for attempt in attempts:
-        command = [str(server), "-m", str(model), "--host", "127.0.0.1", "--port", str(port),
-                   "-ngl", str(ngl), "-c", str(context), "--jinja", "--api-key", api_key,
-                   "-b", str(batch), "-ub", str(ubatch), "-t", str(threads)]
-        if kv_cache != "f16":
-            command += ["-ctk", kv_cache, "-ctv", kv_cache]
-        if attempt != "off":
-            command += ["--flash-attn", attempt]
-        say(f"Launching: {' '.join(command[:-1])} ***")
-        log_handle = LOG_FILE.open("w")
-        process = subprocess.Popen(command, stdout=log_handle, stderr=subprocess.STDOUT,
-                                   env=_server_env(server))
-        state = {"server_pid": process.pid, "port": port, "api_key": api_key,
-                 "model_path": str(model), "context": context}
-        STATE_FILE.write_text(json.dumps(state))
-        try:
-            _wait_health(port, api_key, deadline=time.time() + 900, log=process)
-        except SystemExit as error:
-            process.terminate()
-            if attempt == attempts[-1]:
-                raise
-            say(f"Launch with --flash-attn {attempt} failed; retrying without flash attention.")
-            say(str(error))
-            continue
-        say("llama-server is healthy.")
-        _offload_report(state)
-        return
+    try:
+        info = gpu()
+        budget = info["total_bytes"] - model.stat().st_size - VRAM_OVERHEAD_BYTES
+        say(f"VRAM budget for KV cache + compute ≈ {budget / 1024 ** 3:.2f} GiB")
+    except SystemExit:
+        budget = None
+        say("GPU check unavailable inside serve; relying on the OOM fallback ladder.")
+    attempts = context_candidates(context, budget)
+    flash_attempts = [flash_attn, "off"] if flash_attn != "off" else ["off"]
+    last_error = "no attempt was made"
+    for candidate, origin in attempts:
+        kv = kv_cache or ("q8_0" if candidate >= KV_AUTOSWITCH else "f16")
+        for fa in flash_attempts:
+            command = [str(server), "-m", str(model), "--host", "127.0.0.1", "--port", str(port),
+                       "-ngl", str(ngl), "-c", str(candidate), "--jinja", "--api-key", api_key,
+                       "-b", str(batch), "-ub", str(ubatch), "-t", str(threads)]
+            if kv != "f16":
+                command += ["-ctk", kv, "-ctv", kv]
+            if fa != "off":
+                command += ["--flash-attn", fa]
+            say(f"Launching: {' '.join(command[:-1])} ***")
+            say(f"  context window {candidate:,} tokens ({origin}), KV cache {kv}, flash attention {fa}")
+            log_handle = LOG_FILE.open("w")
+            process = subprocess.Popen(command, stdout=log_handle, stderr=subprocess.STDOUT,
+                                       env=_server_env(server))
+            state = {"server_pid": process.pid, "port": port, "api_key": api_key,
+                     "model_path": str(model), "context": candidate, "kv_cache": kv}
+            STATE_FILE.write_text(json.dumps(state))
+            try:
+                _wait_health(port, api_key, deadline=time.time() + 900, log=process)
+            except SystemExit as error:
+                last_error = str(error)
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                tail = LOG_FILE.read_text(errors="replace") if LOG_FILE.is_file() else ""
+                if _looks_like_oom(tail):
+                    say(f"  Out of GPU memory at {candidate:,} tokens; trying a smaller window…")
+                    break
+                if fa != flash_attempts[-1]:
+                    say(f"Launch with --flash-attn {fa} failed; retrying without flash attention.")
+                    say(str(error))
+                    continue
+                continue
+            say("llama-server is healthy.")
+            if candidate < CONTEXT_PROMISE:
+                say(f"  NOTE: the negotiated window ({candidate:,} tokens) is below the "
+                    f"{CONTEXT_PROMISE:,}-token target — this GPU cannot fit a 10k+ KV cache.")
+            _offload_report(state)
+            return
+    fail("Every context attempt failed. Last error:\n" + last_error[:1200])
 
 
 def _offload_report(state: dict) -> None:
@@ -576,6 +633,44 @@ def stream_test() -> None:
     if not text.strip() and not info["reasoning"].strip():
         fail("The streaming test produced no tokens.")
     say("Streaming test passed.")
+
+
+# ------------------------------------------------------------------- tool calling
+
+
+TOOLS_PROBE = [{
+    "type": "function",
+    "function": {
+        "name": "count_project_files",
+        "description": "Counts the files in the connected Neth workspace. Call this tool instead of answering in words.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}]
+
+
+def tools_check(timeout: float = 420) -> None:
+    """v3.8.2: prove the OpenAI tools API works end to end. The Harmony template
+    (--jinja) must turn a tools request into a native tool_calls answer."""
+    state = read_state() or fail("No running server. Run the pipeline from the start.")
+    payload = _api(state, "v1/chat/completions", method="POST", payload={
+        "messages": [{"role": "user", "content": "Call the count_project_files tool now."}],
+        "tools": TOOLS_PROBE,
+        "tool_choice": "auto",
+        "stream": False,
+        "max_tokens": 512,
+    }, timeout=timeout)
+    if not isinstance(payload, dict) or payload.get("_status"):
+        fail(f"Tool probe got no usable response: {str(payload)[:400]}")
+    choice = (payload.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    names = [((call.get("function") or {}).get("name") or "?") for call in (message.get("tool_calls") or [])]
+    if names:
+        say(f"Tool calling (OpenAI tools API): PASS — native tool call emitted: {', '.join(names)}")
+        return
+    content = str(message.get("content") or "")[:200]
+    say(f"Tool calling (OpenAI tools API): FAIL — no native tool_calls. Reply started: {content!r}")
+    fail("GPT-OSS did not emit a native tool call. --jinja is part of the launch command; "
+         "verify the downloaded llama-server build supports the tools API.")
 
 
 def perf() -> None:
@@ -829,14 +924,14 @@ def main() -> None:
     parser.add_argument("--model", type=Path, default=None)
     parser.add_argument("--server", type=Path, default=None)
     parser.add_argument("--port", type=int, default=8555)
-    parser.add_argument("--context", type=int, default=2048)
+    parser.add_argument("--context", type=int, default=0, help="context tokens; 0 = auto (VRAM-aware ladder, 10,240 floor, OOM fallback)")
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--flash-attn", default="on", choices=["on", "off"])
     parser.add_argument("--ngl", type=int, default=999, help="GPU layers to offload (999 = all)")
     parser.add_argument("--batch", type=int, default=2048)
     parser.add_argument("--ubatch", type=int, default=512)
-    parser.add_argument("--kv-cache", default="f16", choices=["f16", "q8_0", "q4_0"],
-                        help="KV cache precision (-ctk/-ctv); q8_0 doubles the affordable context")
+    parser.add_argument("--kv-cache", default=None, choices=["f16", "q8_0", "q4_0"],
+                        help="KV cache precision (-ctk/-ctv); default auto: q8_0 for windows >= 8192")
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--name", default="Neth Cloud T4")
     parser.add_argument("--deep-hash", action="store_true")
