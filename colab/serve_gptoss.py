@@ -12,7 +12,7 @@ Subcommands (all restartable; nothing is hardcoded to a specific tunnel URL):
   health    Probe /health, /v1/models, /props and confirm the API key is enforced.
   stream    One streaming chat completion; prints tokens and the reasoning channel.
   perf      Measure load status, prompt/generation speed, TTFT and VRAM.
-  tunnel    Start a cloudflared quick tunnel and print the NETHCLOUD1 connect code.
+  tunnel    Start a verified cloudflared quick tunnel and print the NETHCLOUD1 connect code.
   stop      Stop the tunnel and the server started by `serve`.
 
 The model file name is verified against the Hugging Face repository listing at
@@ -570,9 +570,32 @@ def perf() -> None:
 
 # ------------------------------------------------------------------------ tunnel
 
+_TUNNEL_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
 
-def tunnel(port: int, name: str) -> None:
-    state = read_state() or fail("No running server. Run the serve cell first.")
+
+def _tunnel_alive(url: str) -> bool:
+    """True if the public URL routes to the local llama-server through the tunnel.
+
+    Any response from the origin counts — even 401/503, because llama-server
+    answers those while loading or when auth is required. Cloudflare's
+    dead-tunnel error page (HTTP 530 carrying "error code: 10xx", e.g. 1033) or
+    a connection failure means the tunnel is not connected.
+    """
+    try:
+        with urllib.request.urlopen(f"{url}/health", timeout=15) as response:
+            return response.status < 500
+    except urllib.error.HTTPError as error:
+        if error.code == 530:
+            return False  # Cloudflare's dead-tunnel status (1016/1033 pages)
+        body = error.read(65536) or b""
+        if error.code >= 500 and b"error code: 10" in body:
+            return False
+        return True  # 401/403/503 from the origin: the tunnel itself routes
+    except Exception:  # noqa: BLE001 - refused/timeout/DNS: not routable
+        return False
+
+
+def _ensure_cloudflared() -> Path:
     binary = shutil.which("cloudflared") or (BASE_DIR / "bin" / "cloudflared")
     if not binary.is_file():
         (BASE_DIR / "bin").mkdir(parents=True, exist_ok=True)
@@ -586,22 +609,66 @@ def tunnel(port: int, name: str) -> None:
                  "Any HTTPS tunnel to the server port works (ngrok, your own VPS with SSH -L, frp, …).")
     version = run([str(binary), "--version"], timeout=60)
     say(f"cloudflared: {version.stdout.strip() or version.stderr.strip()}")
-    process = subprocess.Popen([str(binary), "tunnel", "--url", f"http://127.0.0.1:{port}",
-                                "--no-autoupdate", "--protocol", "http2"],
-                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    public_url = None
+    return binary
+
+
+def _spawn_tunnel(binary: Path, port: int):
+    return subprocess.Popen([str(binary), "tunnel", "--url", f"http://127.0.0.1:{port}",
+                             "--no-autoupdate", "--protocol", "http2"],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
+def _tunnel_url(process) -> str | None:
     deadline = time.time() + 90
-    while time.time() < deadline and public_url is None:
+    while time.time() < deadline:
         line = process.stdout.readline()
         if not line and process.poll() is not None:
-            break
-        match = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line or "")
+            return None
+        match = _TUNNEL_URL_RE.search(line or "")
         if match:
-            public_url = match.group(0)
-    if not public_url:
+            return match.group(0)
+    return None
+
+
+def tunnel(port: int, name: str) -> None:
+    state = read_state() or fail("No running server. Run the serve cell first.")
+    name = name.strip("\"'").strip() or "Neth Cloud"  # Colab's ! passes quotes through verbatim
+    old = state.get("tunnel_pid")
+    if old:
+        try:
+            os.kill(old, signal.SIGTERM)
+            say(f"Stopped the previous tunnel (pid {old}).")
+            time.sleep(1)
+        except (ProcessLookupError, PermissionError):
+            pass
+    binary = _ensure_cloudflared()
+    public_url = None
+    for attempt in range(1, 4):
+        process = _spawn_tunnel(binary, port)
+        url = _tunnel_url(process)
+        if not url:
+            process.terminate()
+            say(f"Attempt {attempt}/3: cloudflared did not produce a URL.")
+            continue
+        say(f"Attempt {attempt}/3: {url} — checking the tunnel routes to the server …")
+        verified = False
+        for _ in range(6):
+            if _tunnel_alive(url):
+                verified = True
+                break
+            if process.poll() is not None:
+                break
+            time.sleep(4)
+        if verified:
+            public_url = url
+            state["tunnel_pid"] = process.pid
+            break
         process.terminate()
-        fail("cloudflared did not produce a URL. Check the notebook network or use another tunnel.")
-    state["tunnel_pid"] = process.pid
+        say("The URL appeared but never routed to the server; starting a fresh tunnel.")
+    if not public_url:
+        fail("cloudflared could not establish a verified tunnel after 3 attempts "
+             "(network blocked or Cloudflare rejected the quick tunnel). Any HTTPS tunnel "
+             "to the server port works (ngrok, your own VPS with SSH -L, frp, …).")
     state["url"] = public_url
     STATE_FILE.write_text(json.dumps(state))
     code = base64.urlsafe_b64encode(json.dumps({
@@ -616,10 +683,13 @@ def tunnel(port: int, name: str) -> None:
     say(f"NETHCLOUD1.{code}")
     say("=" * 64)
     say("")
-    say("This tunnel lives as long as this Colab session. Free Colab runtimes sleep on idle")
-    say("and disconnect after a few hours; rerun this cell after a reconnect to print a new code.")
+    say("Verified: this URL routed to the server at print time. Quick tunnels are ephemeral —")
+    say("if the app later shows HTTP 530 / error code 1033, the tunnel or the runtime dropped:")
+    say("rerun THIS cell and paste the NEW code (an old code stays dead forever).")
+    say("Keep this tab open and foregrounded. iPadOS suspends background Safari tabs quickly,")
+    say("which disconnects free Colab runtimes — run Colab on a computer when possible.")
     say("For an always-on endpoint use a paid GPU host (GCP/AWS/Lambda/RunPod) and run the")
-    say("same serve + tunnel steps there, or keep Colab as the interactive test environment.")
+    say("same serve + tunnel steps there.")
 
 
 def stop() -> None:
