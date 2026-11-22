@@ -28,12 +28,42 @@ SERVERS: dict[str, dict] = {}
 
 
 def _quote(command: str) -> list[str]:
-    """Windows-safe splitting without a shell."""
+    """Split a command string without a shell. POSIX uses shlex; Windows uses
+    CommandLineToArgvW-style parsing so drive-letter backslashes survive."""
     import shlex
     try:
-        parts = shlex.split(command)
+        if os.name == "nt":
+            return _split_windows(command)
+        return shlex.split(command)
     except ValueError as error:
         raise ToolError(f"could not parse command: {error}") from error
+
+
+def _split_windows(command: str) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    in_quotes = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if char == '"':
+            if in_quotes and index + 1 < len(command) and command[index + 1] == '"':
+                current.append('"')  # doubled quote inside quotes = literal quote
+                index += 2
+                continue
+            in_quotes = not in_quotes
+            index += 1
+            continue
+        if not in_quotes and char.isspace():
+            if current:
+                parts.append("".join(current))
+                current = []
+            index += 1
+            continue
+        current.append(char)
+        index += 1
+    if current:
+        parts.append("".join(current))
     return parts
 
 
