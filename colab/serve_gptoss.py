@@ -456,6 +456,9 @@ def _offload_report(state: dict) -> None:
         if n_ctx:
             say(f"  Server context window: {n_ctx} tokens")
         say("  Chat template: llama.cpp server default (--jinja; Harmony for GPT-OSS checkpoints)")
+        say("Serve cell finished — this cell is DONE. Next: run cell 8 (health check), then cell 11 "
+            "(tunnel + connect code). Cells 9-10 are optional speed tests; the server keeps running "
+            "in the background either way.")
 
 
 def _api(state: dict, path: str, method: str = "GET", payload: dict | None = None,
