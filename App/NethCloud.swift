@@ -77,7 +77,9 @@ struct CloudCompute: Equatable, Sendable {
     let context: Int
     static let maxContext = 32_768
     static let defaultContext = 2_048
-    static let contexts = [2_048, 4_096, 8_192, 16_384, 32_768]
+    // 10,240 is the smallest window the notebook guarantees on a T4 when it
+    // negotiates 10k+ context; larger windows appear when VRAM allows them.
+    static let contexts = [2_048, 4_096, 8_192, 10_240, 16_384, 32_768]
 }
 
 enum CloudStatus: Equatable, Sendable {
@@ -209,6 +211,7 @@ final class NethCloud: ObservableObject {
     @Published private(set) var status: CloudStatus = .idle
     @Published private(set) var remoteModels: [String] = []
     @Published private(set) var sessionOnly: Set<String> = []
+    @Published private(set) var serverContext: Int?
     @Published var context: Int {
         didSet { UserDefaults.standard.set(context, forKey: "cloudContext") }
     }
@@ -235,7 +238,11 @@ final class NethCloud: ObservableObject {
 
     var compute: CloudCompute? {
         guard status.connected, let server = servers.first(where: { $0.id == selectedID }) else { return nil }
-        return CloudCompute(server: server, context: min(context, CloudCompute.maxContext))
+        // The server's own window (from /props) wins over the stored preference:
+        // a notebook that negotiated 10k+ context reports it here, and a smaller
+        // server cannot fulfil a larger request.
+        let window = serverContext.map { min($0, CloudCompute.maxContext) } ?? CloudCompute.maxContext
+        return CloudCompute(server: server, context: min(context, window))
     }
 
     func choose(_ server: CloudServer?) {
@@ -244,17 +251,20 @@ final class NethCloud: ObservableObject {
         if server == nil {
             status = .idle
             remoteModels = []
+            serverContext = nil
         }
     }
 
     func connect(_ candidate: CloudServer) async {
         status = .checking
+        serverContext = nil
         let session = CloudSession(server: candidate)
         do {
             let report = try await session.health()
             var server = candidate
             if server.model.isEmpty { server.model = report.models.first ?? "" }
             remoteModels = report.models
+            serverContext = report.context
             CloudMetrics.shared.record(latency: report.latency)
             add(server)
             selectedID = server.id

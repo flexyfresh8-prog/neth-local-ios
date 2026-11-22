@@ -156,8 +156,19 @@ extension CloudSession {
         if stop.cancelled { return }
         if reasoningOpen { continuation.yield(.text("</think>\n\n")) }
         if !toolCalls.isEmpty {
-            continuation.yield(.text("\n\nThe server emitted \(toolCalls.count) native tool call\(toolCalls.count == 1 ? "" : "s"); "
-                                     + "Neth Local runs tools only through its own Quattro catalog."))
+            // GPT-OSS on llama.cpp (--jinja) can emit native tool_calls. Show the
+            // model's actual calls with their arguments so nothing the backend
+            // decides is hidden; execution stays on the Quattro catalog.
+            let ordered = toolCalls.sorted { $0.key < $1.key }.enumerated().map { position, entry in
+                let call = entry.value
+                let name = call.name.isEmpty ? "tool" : call.name
+                let args = call.arguments.trimmingCharacters(in: .whitespacesAndNewlines)
+                let shown = args.isEmpty ? "" : String(args.prefix(220)) + (args.count > 220 ? "…" : "")
+                return "\(position + 1). \(name)\(shown.isEmpty ? "()" : "(\(shown))")"
+            }
+            continuation.yield(.text("\n\nNative tool call\(toolCalls.count == 1 ? "" : "s") from GPT-OSS:\n"
+                                     + ordered.joined(separator: "\n")
+                                     + "\nNeth Local executes tools only through its own Quattro catalog on this device."))
         }
         let generationSeconds = (firstDelta ?? started).distance(to: Date())
         let tokens = exactTokens ?? counted
