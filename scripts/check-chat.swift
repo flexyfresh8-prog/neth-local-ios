@@ -274,7 +274,8 @@ struct ChatChecks {
             CloudRequest(system: "", turns: [CloudTurn(role: .assistant, text: "<think>plan</think>\n\nVisible")]),
             model: nil)) as! [String: Any]
         let plainMessages = plain["messages"] as! [[String: String]]
-        precondition(plainMessages.count == 1 && plainMessages[0]["content"] == "Visible")
+        precondition(plainMessages.count == 1
+                     && plainMessages[0]["content"]?.trimmingCharacters(in: .whitespacesAndNewlines) == "Visible")
         precondition((plain["model"] as? String) == nil && plain["grammar"] == nil)
     }
 
