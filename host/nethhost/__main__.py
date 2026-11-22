@@ -35,6 +35,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.base:
         os.environ["NETHLOCAL_HOME"] = args.base
 
+    # Windows consoles default to cp1252; non-ASCII output must never crash the host.
+    for stream in (sys.stdout, sys.stderr):
+        if stream and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     from nethhost.config import Config, InstallState
     from nethhost.paths import Layout, base_dir
     from nethhost.setup_env import bootstrap, repair
@@ -50,7 +55,7 @@ def main(argv: list[str] | None = None) -> int:
         report = bootstrap(layout, config, state)
         print(f"{APP_NAME} {__version__} first-launch setup:")
         for step in report["steps"]:
-            detail = f" — {step['detail']}" if step.get("detail") else ""
+            detail = f" -- {step['detail']}" if step.get("detail") else ""
             print(f"  [{step['status']:>6}] {step['name']}{detail}")
     else:
         config.load()
@@ -68,7 +73,7 @@ def main(argv: list[str] | None = None) -> int:
     registry = build_registry()
     app = create_app(config, db, registry, layout)
 
-    print(f"{APP_NAME} listening on {lan_address(args.port)}  (iPad → Settings → Add host)")
+    print(f"{APP_NAME} listening on {lan_address(args.port)}  (iPad -> Settings -> Add host)")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info", access_log=False)
     return 0
 
