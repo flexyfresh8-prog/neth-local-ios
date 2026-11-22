@@ -4,7 +4,7 @@ through llama.cpp's OpenAI-compatible server for the Neth Local iPad app.
 
 Subcommands (all restartable; nothing is hardcoded to a specific tunnel URL):
   gpu       Verify the NVIDIA GPU, driver and VRAM against the known T4 profile.
-  discover  Find a usable llama-server binary without rebuilding llama.cpp.
+  discover  Find, extract or auto-download the prebuilt llama.cpp CUDA release (no rebuild).
   download  Download the GGUF from Hugging Face (resumable, reuses the HF cache).
   verify    Check the GGUF file: size, magic, version, optional deep SHA-256.
   context   Report VRAM headroom and a recommended context size.
@@ -28,9 +28,11 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from pathlib import Path
 
 REPO_ID = "HauhauCS/GPT-OSS-20B-Uncensored-HauhauCS-Aggressive"
@@ -53,8 +55,8 @@ def fail(message: str) -> None:
     raise SystemExit(f"Neth Cloud: {message}")
 
 
-def run(command, timeout=None, check=False):
-    return subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=check)
+def run(command, timeout=None, check=False, env=None):
+    return subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=check, env=env)
 
 
 # --------------------------------------------------------------------------- GPU
@@ -90,25 +92,163 @@ def gpu() -> dict:
 
 # --------------------------------------------------------------------- discovery
 
+LLAMA_RELEASE_TAG = "b12631"
+LLAMA_RELEASE_BASE = f"https://github.com/ggml-org/llama.cpp/releases/download/{LLAMA_RELEASE_TAG}"
+# Verified release assets (HEAD-checked 2026-11-22): 220 MB server + 594 MB CUDA runtime.
+LLAMA_PACKAGES = [
+    "llama-b12631-bin-ubuntu-cuda-12.8-x64.tar.gz",
+    "cudart-llama-b12631-bin-ubuntu-cuda-12.8-x64.tar.gz",
+]
 
-def discover() -> Path:
-    candidates = []
+
+def _extract_archive(archive: Path) -> None:
+    marker = archive.with_name(archive.name + ".extracted")
+    if marker.exists():
+        return
+    say(f"Extracting {archive.name} …")
+    if archive.name.endswith((".tar.gz", ".tgz")):
+        with tarfile.open(archive) as bundle:
+            bundle.extractall(archive.parent, filter="data")
+    elif archive.name.endswith(".zip"):
+        target = archive.parent / archive.stem
+        target.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(archive) as bundle:
+            bundle.extractall(target)
+    else:
+        return
+    marker.write_text("extracted\n")
+
+
+def _extract_archives() -> None:
+    """Extract any prebuilt release archives found under the bin dirs (idempotent)."""
     for base in BIN_DIRS:
         if not base.is_dir():
             continue
-        for path in sorted(base.glob("**/llama-server")):
-            if path.is_file() and os.access(path, os.X_OK):
-                candidates.append(path)
+        for archive in sorted(base.glob("**/*")):
+            if archive.is_file() and archive.name.endswith((".tar.gz", ".tgz", ".zip")) \
+                    and not archive.name.endswith(".extracted"):
+                try:
+                    _extract_archive(archive)
+                except Exception as error:  # noqa: BLE001 - keep trying the other archives
+                    say(f"Could not extract {archive}: {error}")
+
+
+def _download(url: str, dest: Path) -> None:
+    if dest.exists() and dest.stat().st_size > 50_000_000:
+        say(f"Already present: {dest.name} ({dest.stat().st_size:,} bytes)")
+        return
+    partial = dest.with_suffix(dest.suffix + ".part")
+    headers = {"User-Agent": "neth-local-colab/3.7.0"}
+    offset = 0
+    if partial.exists():
+        offset = partial.stat().st_size
+        headers["Range"] = f"bytes={offset}-"
+        say(f"Resuming {dest.name} from {offset:,} bytes")
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=120) as response:
+        if offset and response.status != 206:
+            say("Server ignored the resume request; restarting this download.")
+            offset = 0
+            partial.unlink()
+        total = response.headers.get("Content-Length")
+        total = int(total) + offset if total else None
+        last_report = offset
+        with partial.open("ab") as handle:
+            received = offset
+            while True:
+                block = response.read(1 << 22)
+                if not block:
+                    break
+                handle.write(block)
+                received += len(block)
+                if received - last_report >= (50 << 20):
+                    last_report = received
+                    progress = f"{received / 1e6:,.0f} MB" + (f" / {total / 1e6:,.0f} MB" if total else "")
+                    say(f"  {dest.name}: {progress}")
+    partial.rename(dest)
+    say(f"Downloaded: {dest} ({dest.stat().st_size:,} bytes)")
+
+
+def _fetch_prebuilt() -> None:
+    base = Path("/content/llama-prebuilt")
+    base.mkdir(parents=True, exist_ok=True)
+    say(f"Fetching the official llama.cpp {LLAMA_RELEASE_TAG} prebuilt CUDA 12.8 release (~780 MB total)…")
+    for package in LLAMA_PACKAGES:
+        _download(f"{LLAMA_RELEASE_BASE}/{package}", base / package)
+    for archive in sorted(base.glob("*.tar.gz")):
+        try:
+            _extract_archive(archive)
+        except Exception as error:  # noqa: BLE001 - report and continue
+            say(f"Could not extract {archive}: {error}")
+
+
+def _library_dirs(server: Path) -> list:
+    """Every directory holding .so files inside the extracted release tree.
+
+    The CUDA release ships llama-server plus its shared libs, and the separate
+    cudart archive adds libcudart/libcublas; their layout differs between
+    releases, so collecting the .so directories is safer than guessing one.
+    """
+    root = server.parent
+    for base in BIN_DIRS:
+        if base.is_dir() and base in server.parents:
+            root = base
+            break
+    dirs = {str(server.parent)}
+    try:
+        for shared in root.glob("**/*.so*"):
+            dirs.add(str(shared.parent))
+    except Exception:  # noqa: BLE001 - the binary's own directory is the fallback
+        pass
+    return sorted(dirs)
+
+
+def _server_env(server: Path) -> dict:
+    env = os.environ.copy()
+    existing = env.get("LD_LIBRARY_PATH")
+    env["LD_LIBRARY_PATH"] = ":".join(_library_dirs(server) + ([existing] if existing else []))
+    return env
+
+
+def _probe(path: Path) -> bool:
+    result = run([str(path), "--version"], timeout=60, env=_server_env(path))
+    if result.returncode == 0:
+        version = result.stdout.strip().splitlines()[0] if result.stdout.strip() else "llama-server"
+        say(f"Found llama-server: {path}")
+        say(f"Version: {version}")
+        return True
+    first = result.stderr.strip().splitlines()[0] if result.stderr.strip() else "no output"
+    say(f"Skipping {path}: {first}")
+    if "shared libraries" in result.stderr.lower():
+        say("  (missing shared libraries — launches set LD_LIBRARY_PATH automatically, "
+            "so this usually means the binary was built for a different CUDA version)")
+    return False
+
+
+def discover() -> Path:
+    _extract_archives()
+    candidates = []
+    for base in BIN_DIRS:
+        if base.is_dir():
+            for path in sorted(base.glob("**/llama-server")):
+                if path.is_file() and os.access(path, os.X_OK) and path not in candidates:
+                    candidates.append(path)
+    on_path = shutil.which("llama-server")
+    if on_path and Path(on_path) not in candidates:
+        candidates.append(Path(on_path))
     for path in candidates:
-        probe = run([str(path), "--version"], timeout=30)
-        if probe.returncode == 0:
-            version = probe.stdout.strip().splitlines()[0] if probe.stdout.strip() else "llama-server"
-            say(f"Found llama-server: {path}")
-            say(f"Version: {version}")
+        if _probe(path):
             return path
-        say(f"Skipping {path}: {probe.stderr.strip().splitlines()[0] if probe.stderr.strip() else 'no output'}")
-    fail("No runnable llama-server found under /content/llama-prebuilt or /content/llama.cpp. "
-         "Upload or unzip your prebuilt release first (do not rebuild CUDA here).")
+    say("No runnable llama-server yet. Downloading the official prebuilt release…")
+    _fetch_prebuilt()
+    for base in BIN_DIRS:
+        if base.is_dir():
+            for path in sorted(base.glob("**/llama-server")):
+                if path.is_file() and os.access(path, os.X_OK) and _probe(path):
+                    return path
+    fail("llama-server could not be provisioned automatically. Download BOTH archives below, upload them "
+         "to /content/llama-prebuilt (Colab file panel), then rerun this cell:\n  "
+         + "\n  ".join(f"{LLAMA_RELEASE_BASE}/{name}" for name in LLAMA_PACKAGES))
 
 
 # ---------------------------------------------------------------------- download
@@ -273,7 +413,8 @@ def serve(model: Path | None, server: Path | None, port: int, context: int, api_
             command += ["--flash-attn", attempt]
         say(f"Launching: {' '.join(command[:-1])} ***")
         log_handle = LOG_FILE.open("w")
-        process = subprocess.Popen(command, stdout=log_handle, stderr=subprocess.STDOUT)
+        process = subprocess.Popen(command, stdout=log_handle, stderr=subprocess.STDOUT,
+                                   env=_server_env(server))
         state = {"server_pid": process.pid, "port": port, "api_key": api_key,
                  "model_path": str(model), "context": context}
         STATE_FILE.write_text(json.dumps(state))
