@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tarfile
@@ -388,7 +389,11 @@ def _wait_health(port: int, api_key: str, deadline: float, log) -> None:
                     return
         except urllib.error.HTTPError as error:
             if error.code != 503:
-                fail(f"Unexpected /health response: HTTP {error.code}")
+                body = error.read(4096).decode(errors="replace")
+                _port_diagnosis(port)
+                fail(f"Unexpected /health response: HTTP {error.code}. Body: {body[:300]}. If that body "
+                     "is not llama-server JSON, another service on this VM owns the port — rerun the "
+                     "serve cell; it picks a free port automatically.")
         except Exception:  # noqa: BLE001 - server not accepting yet
             pass
         time.sleep(2)
@@ -402,6 +407,7 @@ def serve(model: Path | None, server: Path | None, port: int, context: int, api_
     model = model or local_model_path() or fail("No model file; run the download cell first.")
     server = server or discover()
     threads = threads or max(2, (os.cpu_count() or 4) - 1)
+    port = _choose_port(port)
     attempts = [flash_attn, "off"] if flash_attn != "off" else ["off"]
     for attempt in attempts:
         command = [str(server), "-m", str(model), "--host", "127.0.0.1", "--port", str(port),
@@ -651,24 +657,67 @@ def _tunnel_url(process) -> str | None:
     return None
 
 
-def _origin_ok(port: int) -> bool:
-    """True if anything answers HTTP on the local server port (401/503 included)."""
+def _port_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def _choose_port(preferred: int) -> int:
+    """Serve on the preferred port, or the next free one if another VM service owns it.
+
+    Some Colab VM images ship services on common ports like 8080; when one of those
+    squats the port, llama-server cannot bind and exits, and the squatter answers
+    404 to every request (notebook and app alike).
+    """
+    if _port_free(preferred):
+        return preferred
+    _port_diagnosis(preferred)
+    for candidate in range(preferred + 1, preferred + 21):
+        if _port_free(candidate):
+            say(f"Port {preferred} is taken by another service on this VM — using {candidate}.")
+            say("The tunnel cell reads the real port from the session state, so just rerun the cells in order.")
+            return candidate
+    fail(f"No free port found in {preferred}…{preferred + 20}; free one and rerun the serve cell.")
+
+
+def _origin_status(port: int) -> str:
+    """Classify what answers on the local server port: 'ok' (llama-server /health
+    reports ok), 'impostor' (something HTTP answers but it is not a healthy
+    llama-server), or 'dead' (nothing listening)."""
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=10) as response:
-            return True
+            body = response.read(4096).decode(errors="replace")
+            status = response.status
+        if status == 200:
+            try:
+                if json.loads(body).get("status") == "ok":
+                    return "ok"
+            except ValueError:
+                pass
+        return "impostor"
     except urllib.error.HTTPError:
-        return True  # an HTTP answer means the process is alive, whatever the status
+        return "impostor"
     except Exception:  # noqa: BLE001 - refused/timeout: nothing listening
-        return False
+        return "dead"
 
 
 def tunnel(port: int, name: str) -> None:
     state = read_state() or fail("No running server. Run the serve cell first.")
-    if not _origin_ok(port):
+    port = state.get("port") or port  # the port llama-server actually launched on
+    origin = _origin_status(port)
+    if origin != "ok":
         _port_diagnosis(port)
-        fail(f"llama-server is not answering on 127.0.0.1:{port} — the session state exists but the "
-             "server process is gone (it exited, or the runtime dropped). Rerun the serve cell "
-             "(cell 7), wait for 'llama-server is healthy', then rerun this cell.")
+        if origin == "dead":
+            fail(f"llama-server is not answering on 127.0.0.1:{port} — the session state exists but "
+                 "the server process is gone (it exited, or the runtime dropped). Rerun the serve "
+                 "cell (cell 7), wait for 'llama-server is healthy', then rerun this cell.")
+        fail(f"Something other than llama-server answered on 127.0.0.1:{port} (its /health is not ok) "
+             "— that service also answers 404 to the app through the tunnel. Rerun the serve cell "
+             "(cell 7): it now detects squatted ports and picks a free one automatically.")
     name = name.strip("\"'").strip() or "Neth Cloud"  # Colab's ! passes quotes through verbatim
     old = state.get("tunnel_pid")
     if old:
@@ -697,7 +746,7 @@ def tunnel(port: int, name: str) -> None:
             if process.poll() is not None:
                 break
             time.sleep(4)
-        if not verified and _origin_ok(port) and process.poll() is None:
+        if not verified and _origin_status(port) == "ok" and process.poll() is None:
             # The public probe keeps failing while the origin is alive and cloudflared
             # holds its edge registration (the URL only appears after registration).
             # Cloudflare restricts some trycloudflare requests from datacenter IPs, so
@@ -776,7 +825,7 @@ def main() -> None:
                                             "health", "stream", "perf", "tunnel", "stop"])
     parser.add_argument("--model", type=Path, default=None)
     parser.add_argument("--server", type=Path, default=None)
-    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--port", type=int, default=8555)
     parser.add_argument("--context", type=int, default=2048)
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--flash-attn", default="on", choices=["on", "off"])
