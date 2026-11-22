@@ -473,6 +473,17 @@ def _api(state: dict, path: str, method: str = "GET", payload: dict | None = Non
 # ------------------------------------------------------------------- health/perf
 
 
+def _port_diagnosis(port: int) -> None:
+    """Print which process, if any, listens on the server port — identifies impostors."""
+    probe = run(["ss", "-ltnp"], timeout=15)
+    lines = [line.strip() for line in probe.stdout.splitlines() if f":{port} " in line]
+    if lines:
+        for line in lines:
+            say(f"  listening: {line}")
+    else:
+        say(f"  nothing is listening on 127.0.0.1:{port}")
+
+
 def health() -> None:
     state = read_state() or fail("No running server. Run the serve cell first.")
     result = _api(state, "health")
@@ -493,7 +504,8 @@ def health() -> None:
 
 
 def stream(state: dict, prompt: str, limit: int = 128) -> tuple[str, dict | None]:
-    request = urllib.request.Request(f"http://127.0.0.1:{state['port']}/v1/chat/completions", method="POST")
+    url = f"http://127.0.0.1:{state['port']}/v1/chat/completions"
+    request = urllib.request.Request(url, method="POST")
     request.add_header("Authorization", f"Bearer {state['api_key']}")
     request.add_header("Content-Type", "application/json")
     payload = {
@@ -507,26 +519,35 @@ def stream(state: dict, prompt: str, limit: int = 128) -> tuple[str, dict | None
     usage = None
     started = time.time()
     first = None
-    with urllib.request.urlopen(request, json.dumps(payload).encode(), timeout=600) as response:
-        for raw in response:
-            line = raw.decode(errors="replace").strip()
-            if not line.startswith("data: "):
-                continue
-            body = line[6:]
-            if body == "[DONE]":
-                break
-            chunk = json.loads(body)
-            usage = chunk.get("usage") or usage
-            choice = (chunk.get("choices") or [{}])[0]
-            delta = choice.get("delta", {})
-            if delta.get("reasoning_content"):
-                reasoning_parts.append(delta["reasoning_content"])
-                first = first or time.time()
-            if delta.get("content"):
-                text_parts.append(delta["content"])
-                first = first or time.time()
-            if choice.get("finish_reason") == "length":
-                break
+    try:
+        with urllib.request.urlopen(request, json.dumps(payload).encode(), timeout=600) as response:
+            for raw in response:
+                line = raw.decode(errors="replace").strip()
+                if not line.startswith("data: "):
+                    continue
+                body = line[6:]
+                if body == "[DONE]":
+                    break
+                chunk = json.loads(body)
+                usage = chunk.get("usage") or usage
+                choice = (chunk.get("choices") or [{}])[0]
+                delta = choice.get("delta", {})
+                if delta.get("reasoning_content"):
+                    reasoning_parts.append(delta["reasoning_content"])
+                    first = first or time.time()
+                if delta.get("content"):
+                    text_parts.append(delta["content"])
+                    first = first or time.time()
+                if choice.get("finish_reason") == "length":
+                    break
+    except urllib.error.HTTPError as error:
+        body_text = error.read(4096).decode(errors="replace")
+        _port_diagnosis(state["port"])
+        fail(f"POST {url} returned HTTP {error.code}. Response body: {body_text[:400]}")
+    except Exception as error:  # noqa: BLE001 - unreachable server or mid-stream drop
+        _port_diagnosis(state["port"])
+        fail(f"POST {url} failed: {error}. If nothing is listening, llama-server exited — "
+             "rerun the serve cell (cell 7) and wait for 'llama-server is healthy'.")
     return "".join(text_parts), {
         "reasoning": "".join(reasoning_parts),
         "usage": usage,
@@ -630,8 +651,24 @@ def _tunnel_url(process) -> str | None:
     return None
 
 
+def _origin_ok(port: int) -> bool:
+    """True if anything answers HTTP on the local server port (401/503 included)."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=10) as response:
+            return True
+    except urllib.error.HTTPError:
+        return True  # an HTTP answer means the process is alive, whatever the status
+    except Exception:  # noqa: BLE001 - refused/timeout: nothing listening
+        return False
+
+
 def tunnel(port: int, name: str) -> None:
     state = read_state() or fail("No running server. Run the serve cell first.")
+    if not _origin_ok(port):
+        _port_diagnosis(port)
+        fail(f"llama-server is not answering on 127.0.0.1:{port} — the session state exists but the "
+             "server process is gone (it exited, or the runtime dropped). Rerun the serve cell "
+             "(cell 7), wait for 'llama-server is healthy', then rerun this cell.")
     name = name.strip("\"'").strip() or "Neth Cloud"  # Colab's ! passes quotes through verbatim
     old = state.get("tunnel_pid")
     if old:
@@ -643,6 +680,7 @@ def tunnel(port: int, name: str) -> None:
             pass
     binary = _ensure_cloudflared()
     public_url = None
+    note = None
     for attempt in range(1, 4):
         process = _spawn_tunnel(binary, port)
         url = _tunnel_url(process)
@@ -659,6 +697,17 @@ def tunnel(port: int, name: str) -> None:
             if process.poll() is not None:
                 break
             time.sleep(4)
+        if not verified and _origin_ok(port) and process.poll() is None:
+            # The public probe keeps failing while the origin is alive and cloudflared
+            # holds its edge registration (the URL only appears after registration).
+            # Cloudflare restricts some trycloudflare requests from datacenter IPs, so
+            # a failed probe from inside Colab does not always mean a dead tunnel.
+            verified = True
+            note = ("The public URL did not answer from inside Colab (Cloudflare restricts some "
+                    "trycloudflare requests from datacenter IPs). The server is alive locally and "
+                    "the tunnel is registered — connect from the app; if it shows HTTP 530, rerun "
+                    "this cell.")
+            say("  Public probe failed, but the server is alive and the tunnel is registered.")
         if verified:
             public_url = url
             state["tunnel_pid"] = process.pid
@@ -683,7 +732,10 @@ def tunnel(port: int, name: str) -> None:
     say(f"NETHCLOUD1.{code}")
     say("=" * 64)
     say("")
-    say("Verified: this URL routed to the server at print time. Quick tunnels are ephemeral —")
+    if note:
+        say(note)
+    else:
+        say("Verified: this URL routed to the server at print time. Quick tunnels are ephemeral —")
     say("if the app later shows HTTP 530 / error code 1033, the tunnel or the runtime dropped:")
     say("rerun THIS cell and paste the NEW code (an old code stays dead forever).")
     say("Keep this tab open and foregrounded. iPadOS suspends background Safari tabs quickly,")
