@@ -52,6 +52,61 @@ jobs:
       - name: Run cloud contract tests
         run: python -m pytest tests/test_cloud_contract.py -v
 
+  nethhost:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install runtime and test dependencies
+        run: python -m pip install fastapi "uvicorn[standard]" httpx pytest pytest-asyncio
+      - name: Run host test suite
+        working-directory: host
+        run: python -m pytest -v
+      - name: Install PyInstaller
+        run: python -m pip install "pyinstaller>=6.10"
+      - name: Build NethHost-v2.0.0.exe
+        working-directory: host/build
+        run: >
+          pyinstaller NethHost.spec --noconfirm
+          --distpath ../../out/nethhost
+          --workpath "$env:RUNNER_TEMP\pyinstaller"
+      - name: Smoke-test the executable (setup, boot, auth)
+        shell: pwsh
+        run: |
+          $base = "$env:RUNNER_TEMP\nethlocal"
+          $exe = (Get-Item out/nethhost/NethHost-v2.0.0.exe).FullName
+          $process = Start-Process $exe `
+            -ArgumentList "--port","8629","--host","127.0.0.1","--base","$base" `
+            -PassThru -NoNewWindow `
+            -RedirectStandardOutput "$env:RUNNER_TEMP\host.log" `
+            -RedirectStandardError "$env:RUNNER_TEMP\host.err"
+          Start-Sleep -Seconds 15
+          if ($process.HasExited) {
+            Get-Content "$env:RUNNER_TEMP\host.log" -ErrorAction SilentlyContinue
+            Get-Content "$env:RUNNER_TEMP\host.err" -ErrorAction SilentlyContinue
+            throw "NethHost.exe exited at launch."
+          }
+          $health = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8629/healthz
+          if ($health.Content -notmatch 'NethHost') { throw "unexpected health body: $($health.Content)" }
+          try {
+            $response = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8629/api/tools -SkipHttpErrorCheck
+            $code = $response.StatusCode
+          } catch { $code = $_.Exception.Response.StatusCode.value__ }
+          if ($code -ne 401) { throw "the API accepted an unauthenticated request (HTTP $code)" }
+          Stop-Process -Id $process.Id -Force
+          Write-Host "NethHost.exe boot, health and auth checks passed."
+      - uses: actions/upload-artifact@v6
+        with:
+          name: NethHost-v2
+          path: out/nethhost/NethHost-v2.0.0.exe
+          if-no-files-found: error
+          compression-level: 0
+
   windows:
     runs-on: windows-2022
     timeout-minutes: 30

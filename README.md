@@ -2,9 +2,11 @@
 
 Neth Local runs GGUF models on the iPad with llama.cpp. It downloads the HauhauCS Qwen3.5 4B Uncensored Q4_K_M checkpoint and an optional vision projector from Hugging Face. Both downloads are pinned to a specific revision and checked by SHA-256 before installation. The app supports local inference, shared text inference with a paired Windows computer, and remote inference on a cloud GPU (Neth Cloud, new in v3.7.0).
 
+**New in v3.8.2:** cloud context can now run at 10k+ tokens — the Colab notebook negotiates a 16,384-token window automatically (with an out-of-memory fallback ladder and a hard 10,240-token floor), the app shows the server's real context window and clamps requests to it, and native GPT-OSS tool calls are surfaced with their names and arguments. **NethHost v2.0.0** (new) is the autonomous coding host for Windows: see [docs/NETH_HOST.md](docs/NETH_HOST.md).
+
 ## Build
 
-Run **Build Neth Local apps** in GitHub Actions. Download **NethLocal-iPad** for the IPAs and **NethLocal-Windows** for the standalone Windows companion. For a local iPad build on macOS with Xcode, CMake, and Python 3.12 or newer, run `bash scripts/build-ipa.sh`. The IPAs are written to `out/`.
+Run **Build Neth Local apps** in GitHub Actions. Download **NethLocal-iPad** for the IPAs, **NethHost-v2** for the coding host executable, and **NethLocal-Windows** for the standalone Windows companion. For a local iPad build on macOS with Xcode, CMake, and Python 3.12 or newer, run `bash scripts/build-ipa.sh`. The IPAs are written to `out/`.
 
 Both IPA filenames include the app version. For Impactor choose `NethLocal-v<version>-Impactor.ipa`, select **Signing → Apple ID**, leave the custom **Entitlements** field empty, and click **Install**. The app executable carries the Increased Memory Limit and Extended Virtual Addressing requests for Impactor to discover. Apple's provisioning profile determines which capabilities the signed app receives. The build also includes an unsigned package and the entitlement plist for other signing workflows. Both packages target ARM64 on iPadOS 18 and later. [Apple’s Increased Memory Limit documentation](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.kernel.increased-memory-limit)
 
@@ -48,3 +50,9 @@ Enable **Quattro** in the main composer. It can choose tools for calculations, t
 Use the **Effort** menu to choose Quick, Balanced, Deep or Max. The bar shows the current phase and step. If a reply hits a token or context limit, the app can continue from a bounded trailing excerpt. Tap **Continue** to resume a saved reply after stopping or reaching the effort limit.
 
 Tap **Files** and describe a file or project, or type `/file Notes.pdf Summarize the topic ...`. Quattro plans the files, saves them inside the conversation and creates a ZIP for multi-file projects. Open file cards for a preview or use Share to save them to Files. **Save as file** on an existing answer also supports Markdown, text and PDF.
+
+## NethHost v2 — the autonomous coding host
+
+**NethHost-v2.0.0.exe** turns a Windows PC into the tool-execution half of Neth Local: the Colab notebook runs GPT-OSS 20B, the iPad shows the interface, and NethHost runs the agent loop, the real filesystem, commands, git and live website previews under `D:\NethLocal`. The PC still does not need to run the model. Setup is automatic on first launch (folders, SQLite databases, API key, toolchain report, idempotent install state), and the console prints the LAN address the iPad connects to.
+
+The host speaks an OpenAI-compatible tool-calling loop: GPT-OSS proposes tool calls, NethHost executes them through a validated registry (17 tools: files, patch, commands, Python, dependency install, dev servers, git, browser capture) and feeds results back until the task is done. Context is compressed automatically at ~72% of the backend window with preserved notes for objectives, paths and errors. A live preview serves each project with auto-reload, and console errors can be captured back to the agent when Playwright is installed. Everything requires the Bearer API key generated at setup. Full setup, API reference and security notes: [docs/NETH_HOST.md](docs/NETH_HOST.md).

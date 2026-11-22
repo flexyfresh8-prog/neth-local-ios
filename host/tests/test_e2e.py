@@ -7,6 +7,7 @@ preview serves the real rendered page with reload injection.
 from __future__ import annotations
 
 import json
+import sys
 
 from nethhost.agent.model_client import StreamDelta
 from nethhost.agent.orchestrator import Orchestrator
@@ -57,7 +58,8 @@ async def test_website_create_serve_and_fix(config, db, registry, layout):
                                                             "content": BROKEN_PAGE})}}])],
         [StreamDelta(tool_calls=[{"id": "c2", "type": "function", "function": {
             "name": "start_dev_server", "arguments": json.dumps({
-                "command": "python3 -m http.server 8681 --bind 127.0.0.1", "port": 8681})}}])],
+                "command": f"{sys.executable} -m http.server 8681 --bind 127.0.0.1",
+                "port": 8681})}}])],
         [StreamDelta(content="Fixed the canvas id typo.", finish="stop")],
     ])
     manager = ContextManager(db, NoopSummarizer())

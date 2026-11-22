@@ -148,3 +148,18 @@ shaping) and the signed-device build in GitHub Actions.
 - Nothing in the repo embeds a tunnel URL, API key or account credential.
 - If you used a fine-grained GitHub token to fetch this repository, revoke it once you are
   done — it was pasted in plain text.
+
+## What is new in 3.8.2
+
+| Piece | Where | What changed |
+| --- | --- | --- |
+| Context negotiation | launcher `serve()` | `--context 0` (now the default in both notebooks) picks the largest window from a ladder (16,384 → 10,240 on the T4) based on the VRAM budget, then falls back down the ladder when the log shows an out-of-memory exit |
+| KV cache | launcher `serve()` | q8_0 is selected automatically for windows ≥ 8,192 tokens, halving the KV cost so 10k+ fits next to the 12.1 GB model on a 16 GB T4 |
+| 10,240 floor | launcher | auto mode never silently serves less than 10,240 tokens; if the GPU cannot fit it, the launch says so explicitly |
+| Tools verification | launcher `tools_check()` | after `/health` passes, a real `tools` request is sent to `/v1/chat/completions`; the connect code is only printed after a native `tool_calls` answer proves the OpenAI tools API works |
+| App side | `App/NethCloud.swift`, `CloudPanel.swift` | the app reads the server window from `/props`, shows it in the Cloud panel, and clamps requests to it; a 10,240-token option was added to the context picker |
+| Tool-call surfacing | `App/CloudEngine.swift` | native GPT-OSS `tool_calls` are printed with names and arguments (execution stays in the Quattro catalog) |
+
+Tuning: pass `--context 32768` to pin the ladder at 32k, or `--kv-cache f16|q8_0|q4_0`
+to override the automatic KV precision. `--flash-attn off` remains an automatic
+retry when a build rejects the flag.
