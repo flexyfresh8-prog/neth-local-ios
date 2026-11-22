@@ -14,7 +14,7 @@ import argparse
 import os
 import sys
 
-from . import APP_NAME, DEFAULT_PORT, __version__
+from nethhost import APP_NAME, DEFAULT_PORT, __version__
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -35,9 +35,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.base:
         os.environ["NETHLOCAL_HOME"] = args.base
 
-    from .config import Config, InstallState
-    from .paths import Layout, base_dir
-    from .setup_env import bootstrap, repair
+    from nethhost.config import Config, InstallState
+    from nethhost.paths import Layout, base_dir
+    from nethhost.setup_env import bootstrap, repair
 
     layout = Layout(base_dir())
     config = Config(layout)
@@ -59,9 +59,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"API key: stored in {layout.config_file} (never committed, never logged)")
     print("Connect the Colab backend with POST /api/backend/config or in the iPad Settings.")
 
-    from .api.server import create_app, lan_address
-    from .database import Database
-    from .tools import build_registry
+    from nethhost.api.server import create_app, lan_address
+    from nethhost.database import Database
+    from nethhost.tools import build_registry
     import uvicorn
 
     db = Database(layout.memory)
